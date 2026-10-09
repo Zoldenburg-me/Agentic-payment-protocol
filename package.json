@@ -1,0 +1,29 @@
+{
+  "name": "agentpay-hub",
+  "version": "0.1.0",
+  "description": "One interface for agent payment protocols (x402, MPP, ...). Detects what a payee speaks, enforces spend policy, pays.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "agentpay-mcp": "dist/mcp/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "mcp": "tsx src/mcp/server.ts",
+    "demo": "tsx examples/demo.ts",
+    "pay": "tsx examples/pay-url.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "viem": "^2.57.3",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
