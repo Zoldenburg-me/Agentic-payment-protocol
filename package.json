@@ -10,10 +10,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\"",
     "mcp": "tsx src/mcp/server.ts",
     "demo": "tsx examples/demo.ts",
-    "pay": "tsx examples/pay-url.ts"
+    "pay": "tsx examples/pay-url.ts",
+    "coverage": "c8 --check-coverage --lines 80 --branches 80 --functions 80 --include \"src/**\" --exclude \"src/mcp/server.ts\" --reporter text-summary --reporter text node --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\""
   },
   "license": "MIT",
   "dependencies": {
@@ -23,7 +24,19 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
+    "c8": "^10.1.3",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol/index.d.ts",
+      "default": "./dist/protocol/index.js"
+    },
+    "./package.json": "./package.json"
   }
 }

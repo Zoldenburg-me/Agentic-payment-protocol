@@ -5,10 +5,8 @@ import { z } from 'zod';
 import { UNSUPPORTED_PROTOCOLS } from '../adapters/index.js';
 import { formatUsd } from '../assets.js';
 import { hubFromEnv } from '../config.js';
-import type { HubResult, QuoteReport } from '../hub.js';
-import { assertPublicHttps, readCapped, redactUrl } from '../net-guard.js';
-
-const MAX_BODY_CHARS = 20_000;
+import { assertPublicHttps, redactUrl } from '../net-guard.js';
+import { render, text } from './render.js';
 
 const requestShape = {
   url: z.string().url().describe('The https URL of the paid resource'),
@@ -19,10 +17,6 @@ const requestShape = {
 
 const hub = hubFromEnv();
 const server = new McpServer({ name: 'agentpay-hub', version: '0.1.0' });
-
-const text = (value: unknown) => ({
-  content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
-});
 
 /** Returns an error result if the URL must not be fetched, else undefined. */
 async function refuse(url: string, spending: boolean) {
@@ -36,53 +30,6 @@ async function refuse(url: string, spending: boolean) {
     return fail(`URL refused: ${error instanceof Error ? error.message : 'invalid URL'}`);
   }
   return undefined;
-}
-
-const summarize =(r: QuoteReport) => ({
-  protocol: r.quote.protocol,
-  payee: r.quote.payee,
-  network: r.quote.amount.network,
-  asset: r.quote.amount.asset,
-  atomicAmount: r.quote.amount.atomic.toString(),
-  usd: r.verdict.ok ? formatUsd(r.verdict.usdMicros) : undefined,
-  allowedByPolicy: r.verdict.ok,
-  blockedReason: r.verdict.ok ? undefined : r.verdict.reason,
-  walletCanPay: r.canPay,
-});
-
-const readBody = async (res: Response) => {
-  const { text: body, truncated } = await readCapped(res, MAX_BODY_CHARS);
-  return { body, ...(truncated ? { truncated: true } : {}) };
-};
-
-async function render(result: HubResult) {
-  switch (result.status) {
-    case 'free':
-      return text({
-        status: 'free (no payment needed)',
-        httpStatus: result.response.status,
-        // Redirects are never followed (payment is bound to the exact URL asked for).
-        ...(result.response.headers.get('location') ? { redirectTo: result.response.headers.get('location') } : {}),
-        ...(await readBody(result.response)),
-      });
-    case 'paid':
-      return text({
-        status: 'paid',
-        protocol: result.quote.protocol,
-        paidUsd: formatUsd(result.usdMicros),
-        receipt: result.receipt?.reference ?? null,
-        httpStatus: result.response.status,
-        ...(await readBody(result.response)),
-      });
-    case 'quoted':
-      return text({ status: 'quoted (nothing paid)', options: result.quotes.map(summarize) });
-    case 'blocked':
-      return { ...text({ status: 'blocked: nothing was paid', options: result.quotes.map(summarize) }), isError: true };
-    case 'rejected':
-      return { ...text({ status: 'payment rejected by server; reservation released', protocol: result.quote.protocol }), isError: true };
-    case 'unsupported':
-      return { ...text('Server returned 402 but none of the supported payment protocols (x402 v2, MPP charge) was offered.'), isError: true };
-  }
 }
 
 server.registerTool(

@@ -1,7 +1,8 @@
-import { type AssetRegistry, DEFAULT_ASSETS } from './assets.js';
+import { type AssetRegistry, DEFAULT_ASSETS, assetKey } from './assets.js';
 import { DEFAULT_ADAPTERS } from './adapters/index.js';
 import { Ledger } from './ledger.js';
 import { DEFAULT_POLICY, type Policy, type Verdict, evaluate } from './policy.js';
+import { ProtocolError, ProtocolErrorCode } from './protocol/errors.js';
 import type { ProtocolAdapter, Quote, Receipt, Wallet } from './types.js';
 
 export interface HubOptions {
@@ -30,7 +31,7 @@ export type HubResult =
   | { readonly status: 'free'; readonly response: Response }
   | { readonly status: 'quoted'; readonly quotes: readonly QuoteReport[] }
   | { readonly status: 'blocked'; readonly quotes: readonly QuoteReport[] }
-  | { readonly status: 'unsupported'; readonly response: Response }
+  | { readonly status: 'unsupported'; readonly response: Response; readonly reason?: 'cross-origin' }
   | {
       readonly status: 'paid';
       readonly response: Response;
@@ -43,6 +44,23 @@ export type HubResult =
 export type HubMode = 'pay' | 'quote';
 
 const REQUEST_TIMEOUT_MS = 15_000;
+
+/** Frees the connection of a response the caller never sees. */
+async function discardBody<T>(res: Response, result: T): Promise<T> {
+  await res.body?.cancel().catch(() => undefined);
+  return result;
+}
+
+/** True if the response did not come from the origin that was asked (a followed redirect). */
+function leftOrigin(res: Response, requested: string): boolean {
+  if (res.redirected) return true;
+  if (!res.url) return false;
+  try {
+    return new URL(res.url).origin !== new URL(requested).origin;
+  } catch {
+    return true;
+  }
+}
 
 /** Agent-supplied headers can never override payment headers, whatever their casing. */
 function mergeHeaders(
@@ -85,6 +103,9 @@ export class PaymentHub {
   async request(url: string, init: HubRequest = {}, mode: HubMode = 'pay'): Promise<HubResult> {
     const first = await this.send(url, init);
     if (first.status !== 402) return { status: 'free', response: first };
+    // A 402 that came from somewhere else (a fetch that followed a redirect anyway) is not
+    // an offer for this URL: paying it would send a signature the asked-for origin never quoted.
+    if (leftOrigin(first, url)) return { status: 'unsupported', response: first, reason: 'cross-origin' };
 
     // A malformed offer from one protocol must not break the others.
     const quotes = (
@@ -96,37 +117,47 @@ export class PaymentHub {
     const reports = quotes.map<QuoteReport>((quote) => ({
       quote,
       verdict: evaluate(quote, this.policy, this.assets, spent),
-      canPay: this.adapterFor(quote).canPay(this.wallet),
+      canPay: this.adapterFor(quote).canPay(this.wallet) && this.signable(quote),
     }));
-    if (mode === 'quote') return { status: 'quoted', quotes: reports };
+    if (mode === 'quote') return discardBody(first, { status: 'quoted', quotes: reports });
 
     const choice = this.choose(reports);
-    if (!choice || !choice.verdict.ok) return { status: 'blocked', quotes: reports };
+    if (!choice || !choice.verdict.ok) return discardBody(first, { status: 'blocked', quotes: reports });
+    await discardBody(first, undefined);
+    return this.pay(url, init, choice.quote, choice.verdict.usdMicros, reports);
+  }
 
+  private async pay(
+    url: string, init: HubRequest, quote: Quote, usdMicros: bigint, reports: readonly QuoteReport[],
+  ): Promise<HubResult> {
     // Reserve synchronously with the policy check so concurrent calls cannot overspend.
-    const entryId = this.ledger.reserve(url, choice.quote.protocol, choice.verdict.usdMicros);
-    const adapter = this.adapterFor(choice.quote);
+    const entryId = this.ledger.reserve(url, quote.protocol, usdMicros);
+    const adapter = this.adapterFor(quote);
 
     let payHeaders: Readonly<Record<string, string>>;
     try {
-      payHeaders = await adapter.authorize(choice.quote, this.wallet);
+      payHeaders = await adapter.authorize(quote, this.wallet);
     } catch (error) {
-      // Nothing was signed or sent, so nothing can be spent.
-      this.ledger.settle(entryId, 'released');
+      // An x402 signer only signs: nothing was sent, so nothing can be spent. An MPP signer
+      // may already have paid before failing, so its amount stays counted.
+      this.ledger.settle(entryId, quote.protocol === 'x402' ? 'released' : 'unconfirmed');
+      if (error instanceof ProtocolError && error.code === ProtocolErrorCode.ASSET_DOMAIN_UNPINNED) {
+        return { status: 'blocked', quotes: reports }; // the signer's registry lacks this asset
+      }
       throw error;
     }
 
     try {
       const second = await this.send(url, { ...init, headers: mergeHeaders(init.headers, payHeaders) });
-      const receipt = adapter.parseReceipt(second);
-      // Even a 402 reply keeps the amount counted: the server holds a valid signed
-      // authorization and could still settle it, so only the day rollover frees it.
-      this.ledger.settle(entryId, second.ok ? 'paid' : 'unconfirmed', receipt?.reference);
-      if (second.status === 402) return { status: 'rejected', response: second, quote: choice.quote };
-      return {
-        status: 'paid', response: second, quote: choice.quote,
-        usdMicros: choice.verdict.usdMicros, ...(receipt ? { receipt } : {}),
-      };
+      // Anything but a same-origin 2xx keeps the amount counted and is not delivery: the
+      // server holds a valid signed authorization and could still settle it, a redirect is
+      // never followed, and an error status served nothing.
+      const rejected = !second.ok || leftOrigin(second, url);
+      // Only a successful reply from the origin that was paid may set the ledger reference.
+      const receipt = rejected ? undefined : adapter.parseReceipt(second);
+      this.ledger.settle(entryId, rejected ? 'unconfirmed' : 'paid', receipt?.reference);
+      if (rejected) return { status: 'rejected', response: second, quote };
+      return { status: 'paid', response: second, quote, usdMicros, ...(receipt ? { receipt } : {}) };
     } catch (error) {
       this.ledger.settle(entryId, 'unconfirmed'); // sent but outcome unknown
       throw error;
@@ -145,6 +176,12 @@ export class PaymentHub {
       ...(init.headers ? { headers: { ...init.headers } } : {}),
       ...(init.body !== undefined ? { body: init.body } : {}),
     });
+  }
+
+  /** x402 is EIP-3009: only offers whose EIP-712 domain is pinned in the registry can be signed. */
+  private signable(quote: Quote): boolean {
+    if (quote.protocol !== 'x402') return true;
+    return this.assets.get(assetKey(quote.amount.network, quote.amount.asset))?.eip712 !== undefined;
   }
 
   private adapterFor(quote: Quote): ProtocolAdapter {
