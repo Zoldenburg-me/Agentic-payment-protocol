@@ -253,10 +253,11 @@ describe('viemSubmitter', () => {
     await assert.rejects(s.submit(call()), (e: unknown) => !(e instanceof ChainRevertError) && /timed out/.test(String(e)));
   });
 
-  it('concurrent submits go out one at a time, each with its own nonce', async () => {
+  it('concurrent submits for different authorizations go out one at a time, each with its own nonce', async () => {
     const rpc = estimating(80_000n);
     const s = submitterOf(rpc);
-    await Promise.all([s.submit(call()), s.submit(call()), s.submit(call())]);
+    const withNonce = (n: number): TransferCall => ({ ...call(), authorization: { ...call().authorization, nonce: pad(numberToHex(n), { size: 32 }) } });
+    await Promise.all([s.submit(withNonce(1)), s.submit(withNonce(2)), s.submit(withNonce(3))]);
     assert.deepEqual(sent(rpc).map((t) => t.nonce), [0, 1, 2]);
   });
 
@@ -280,5 +281,124 @@ describe('viemSubmitter', () => {
     bad({ asset: '0x0000000000000000000000000000000000000000' });
     bad({ surprise: 1 });
     bad({ wallet: rpc.publicClient() });
+  });
+});
+
+describe('viemSubmitter: one transaction per authorization, whatever the timing', () => {
+  const account = privateKeyToAccount(generatePrivateKey());
+  const submitterOf = (rpc: ScriptedRpc, over: Record<string, unknown> = {}) => viemSubmitter({
+    wallet: rpc.walletClient(account), client: rpc.publicClient(), chainId: CHAIN, asset: USDC, payTo: PAY_TO,
+    maxGas: 150_000n, maxFeePerGas: 100_000_000n, timeoutMs: 100, ...over,
+  } as never);
+  const raws = (rpc: ScriptedRpc) => rpc.of('eth_sendRawTransaction').map((c) => c.params[0] as Hex);
+  const nth = (n: number, validBefore = 2_000_000_000n): TransferCall => {
+    const c = call();
+    return { ...c, authorization: { ...c.authorization, nonce: pad(numberToHex(n), { size: 32 }), validBefore } };
+  };
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  /** A node that accepts a raw transaction only after `ms`: a broadcast that outlives the submit deadline. */
+  const slowNode = (ms: number) => {
+    const rpc = new ScriptedRpc().on('eth_estimateGas', () => numberToHex(80_000n));
+    const done: boolean[] = [];
+    rpc.on('eth_sendRawTransaction', (params) => new Promise((resolve) => setTimeout(() => {
+      rpc.nonce += 1;
+      done.push(true);
+      resolve(keccak256(params[0] as Hex));
+    }, ms)));
+    return { rpc, done };
+  };
+
+  it('the returned hash is the hash of the signed transaction', async () => {
+    const rpc = new ScriptedRpc().on('eth_estimateGas', () => numberToHex(80_000n));
+    const hash = await submitterOf(rpc).submit(call());
+    assert.equal(hash, keccak256(raws(rpc)[0] ?? '0x'));
+  });
+
+  it('a retry while a timed-out send is still going waits for it, and never signs a second transaction', async () => {
+    const { rpc } = slowNode(250);
+    const s = submitterOf(rpc);
+    await assert.rejects(s.submit(call()), /timed out/);
+    const again = await s.submit(call()).catch(() => s.submit(call()));
+    assert.equal(new Set(raws(rpc)).size, 1, 'one signed transaction, however often it is broadcast');
+    assert.equal(again, keccak256(raws(rpc)[0] ?? '0x'));
+  });
+
+  it('a retry after a failed broadcast rebroadcasts the same signed transaction', async () => {
+    const rpc = new ScriptedRpc().on('eth_estimateGas', () => numberToHex(80_000n));
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('fetch failed'); });
+    const s = submitterOf(rpc);
+    await assert.rejects(s.submit(call()), (e: unknown) => !(e instanceof ChainRevertError));
+    rpc.on('eth_sendRawTransaction', (params) => keccak256(params[0] as Hex));
+    const hash = await s.submit(call());
+    const [first, second] = raws(rpc);
+    assert.equal(first, second);
+    assert.equal(hash, keccak256(first ?? '0x'));
+    assert.equal(rpc.of('eth_estimateGas').length, 1, 'nothing re-estimated or re-signed');
+  });
+
+  it('the next payment does not start until a timed-out send has really finished', async () => {
+    const { rpc, done } = slowNode(250);
+    const short = submitterOf(rpc);
+    let startedWhileSending = false;
+    rpc.on('eth_estimateGas', () => {
+      if (rpc.of('eth_sendRawTransaction').length > done.length) startedWhileSending = true;
+      return numberToHex(80_000n);
+    });
+    await assert.rejects(short.submit(nth(1)), /timed out/);
+    await short.submit(nth(2)).catch(() => undefined);
+    await wait(400);
+    await short.submit(nth(3)).catch(() => undefined);
+    await wait(400);
+    assert.equal(startedWhileSending, false);
+    assert.deepEqual(rpc.of('eth_sendRawTransaction').map((c) => parseTransaction(c.params[0] as Hex).nonce), [0, 1]);
+  });
+
+  it('a queued submit whose deadline passes before it starts is refused before sending', async () => {
+    const rpc = new ScriptedRpc().on('eth_estimateGas', () => numberToHex(80_000n)).on('eth_sendRawTransaction', hang);
+    const s = submitterOf(rpc);
+    const first = assert.rejects(s.submit(nth(1)), /timed out/);
+    await assert.rejects(s.submit(nth(2)), (e: unknown) => e instanceof ChainRevertError && /busy/.test(e.message));
+    await first;
+    assert.equal(rpc.of('eth_estimateGas').length, 1);
+  });
+
+  it('the nonce never goes backwards when the RPC pending count lags', async () => {
+    const rpc = new ScriptedRpc().on('eth_estimateGas', () => numberToHex(80_000n)).on('eth_getTransactionCount', () => numberToHex(0));
+    const s = submitterOf(rpc);
+    await s.submit(nth(1));
+    await s.submit(nth(2));
+    assert.deepEqual(raws(rpc).map((r) => parseTransaction(r).nonce), [0, 1]);
+  });
+
+  it('an expired authorization is forgotten: it is never rebroadcast', async () => {
+    const rpc = new ScriptedRpc().on('eth_estimateGas', () => numberToHex(80_000n));
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('fetch failed'); });
+    const s = submitterOf(rpc);
+    await assert.rejects(s.submit(nth(1, 1n)));
+    await assert.rejects(s.submit(nth(1, 1n)));
+    assert.equal(rpc.of('eth_estimateGas').length, 2, 'signed afresh, not replayed');
+  });
+
+  it('refuses to estimate on a client for another chain, and sends nothing', async () => {
+    const rpc = new ScriptedRpc().on('eth_estimateGas', () => numberToHex(80_000n));
+    const other = new ScriptedRpc();
+    other.chainId = 8453;
+    const s = submitterOf(rpc, { client: other.publicClient() });
+    await assert.rejects(s.submit(call()), isConfig);
+    assert.equal(raws(rpc).length, 0);
+  });
+
+  it('options are parsed strictly: the wallet needs a local account', () => {
+    const rpc = new ScriptedRpc();
+    const jsonRpc = { ...rpc.walletClient(account), account: { address: account.address, type: 'json-rpc' } };
+    assert.throws(() => submitterOf(rpc, { wallet: jsonRpc }), isConfig);
+  });
+});
+
+describe('viemChain: reading the newest block', () => {
+  it('findAuthorizationUse searches up to the latest block, not a head read earlier', async () => {
+    const rpc = new ScriptedRpc().on('eth_getLogs', () => []);
+    await chainOf(rpc).findAuthorizationUse(USDC, PAYER, NONCE);
+    assert.equal((rpc.of('eth_getLogs')[0]?.params[0] as { toBlock: string }).toBlock, 'latest');
   });
 });

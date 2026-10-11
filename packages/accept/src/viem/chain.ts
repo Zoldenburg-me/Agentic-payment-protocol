@@ -91,11 +91,12 @@ export function viemChain(options: ViemChainOptions): ChainPort {
     }),
 
     findAuthorizationUse: (asset, authorizer, nonce) => run('findAuthorizationUse', async () => {
+      // The window starts from this head but ends at 'latest': a use in a block mined since is still found.
       const head = await client.getBlockNumber({ cacheTime: 0 });
       const topics = encodeEventTopics({ abi: TOKEN_EVENTS, eventName: 'AuthorizationUsed', args: { authorizer: authorizer as Hex, nonce } });
       const found = await client.request({
         method: 'eth_getLogs',
-        params: [{ address: asset as Hex, topics: topics as (Hex | null)[], fromBlock: numberToHex(head > lookback ? head - lookback : 0n), toBlock: numberToHex(head) }],
+        params: [{ address: asset as Hex, topics: topics as (Hex | null)[], fromBlock: numberToHex(head > lookback ? head - lookback : 0n), toBlock: 'latest' }],
       });
       if (!Array.isArray(found)) throw new Error('eth_getLogs returned no list');
       const last = found[0] as { transactionHash?: unknown } | undefined; // a nonce is used at most once

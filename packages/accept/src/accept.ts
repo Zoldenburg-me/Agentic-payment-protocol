@@ -658,7 +658,7 @@ export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
   };
   const ctx: Ctx = {
     config, deps: resolved, background: new Set(), active: new Set(), unsettled: new Map(),
-    env: { config, chain: deps.chain, submitter: deps.submitter, sleep },
+    env: { config, chain: deps.chain, submitter: deps.submitter, sleep, now: deps.now ?? Date.now },
   };
   return {
     async handle(req) {

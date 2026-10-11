@@ -8,6 +8,8 @@ export interface SettleEnv {
   readonly chain: ChainPort;
   readonly submitter: Submitter;
   readonly sleep: (ms: number) => Promise<void>;
+  /** Milliseconds; bounds a wait by elapsed time, not only by its number of polls. */
+  readonly now: () => number;
 }
 
 export interface SettleFailure {
@@ -109,8 +111,9 @@ export async function submit(env: SettleEnv, call: TransferCall): Promise<Submit
 async function waitForReceipt(env: SettleEnv, txHash: Hex): Promise<{ receipt?: TxReceipt; lastError?: unknown }> {
   const { pollIntervalMs, settlementTimeoutMs, minConfirmations } = env.config;
   const polls = Math.ceil(settlementTimeoutMs / pollIntervalMs);
+  const deadline = env.now() + settlementTimeoutMs; // slow RPC calls count too, not just the sleeps
   let lastError: unknown;
-  for (let i = 0; i < polls; i++) {
+  for (let i = 0; i < polls && env.now() < deadline; i++) {
     try {
       const receipt = await env.chain.getReceipt(txHash);
       lastError = undefined;

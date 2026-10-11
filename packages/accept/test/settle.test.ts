@@ -262,3 +262,15 @@ describe('settle: optimistic delivery', () => {
     assert.equal(row?.refusal, E.SUBMIT_FAILED);
   });
 });
+
+describe('settle: waiting is bounded by the clock', () => {
+  it('a confirmation wait stops at settlementTimeoutMs of wall-clock time, however slow each poll is', async () => {
+    let t = 1_800_000_000 * 1000;
+    const s = setup({ settlementTimeoutMs: 60_000, pollIntervalMs: 1 }, { autoMine: false }, {
+      now: () => t, sleep: async () => { t += 10_000; await tick(); },
+    });
+    const r = await s.acceptor.handle(s.req(paid(await payHeader(s.buyer))));
+    assert.equal(codeOf(r), E.SETTLEMENT_TIMEOUT);
+    assert.ok(s.chain.rpcCalls < 200, `polled ${s.chain.rpcCalls} times`);
+  });
+});
