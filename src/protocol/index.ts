@@ -9,7 +9,7 @@ export {
   toChallenge, type MppCredential,
 } from './mpp-codec.js';
 export {
-  DEFAULT_MIN_REMAINING_S, ERC1271_GAS_CAP, resolveDomain, verifyEip3009, viemRpc,
+  DEFAULT_MIN_REMAINING_S, ERC1271_GAS_CAP, RpcRevertError, resolveDomain, verifyEip3009, viemRpc,
   type Eip3009Rpc, type Eip712Domain, type PinnedOffer, type VerifyResult,
 } from './verify-eip3009.js';
 export {
