@@ -71,6 +71,12 @@ export interface Acceptor {
   handle(req: ReqLike): Promise<AcceptResult>;
   /** Hands an error to `onError` (adapters use it for delivery failures). Never throws. */
   reportError(error: unknown): void;
+  /**
+   * Settles, expires or reports open payments without a request: those whose request timed out, or
+   * whose payer never came back. Run it on a timer (e.g. every minute) in one process. Rows still
+   * valid but never sent stay open, since the ledger holds no signature; they expire later.
+   */
+  reconcileOwed(): Promise<ReconcileReport>;
   /** Resolves once optimistic background settlements have finished. */
   idle(): Promise<void>;
 }
@@ -314,12 +320,19 @@ async function recordSubmitted(ctx: Ctx, claimKey: string, txHash: Hex): Promise
   }
 }
 
+/** Where an existing row stands after a look at the chain (the ledger already moved accordingly). */
+type Verdict =
+  | { readonly kind: 'settled' }
+  | { readonly kind: 'refused' | 'open'; readonly code: AcceptErrorCode; readonly status: number };
+
+const verdict = (kind: 'refused' | 'open', code: AcceptErrorCode, status = statusFor(code)): Verdict => ({ kind, code, status });
+
 /** Confirms a known transaction for an existing row. Final only past the deadline, and only if the authorization is unused. */
-async function settleKnown(ctx: Ctx, row: SellerPayment, e: Expected, txHash: Hex, req: ReqLike, price: Price): Promise<AcceptResult> {
+async function judge(ctx: Ctx, row: SellerPayment, e: Expected, txHash: Hex): Promise<Verdict> {
   const done = await confirm(ctx.env, e, txHash);
   if (done.ok) {
     await settleRow(ctx, row.claimKey, done.txHash);
-    return deliverSettled(ctx, row.claimKey, req, price);
+    return { kind: 'settled' };
   }
   reportFailure(ctx, row.claimKey, done);
   const unusedNow = (): Promise<boolean> =>
@@ -328,13 +341,32 @@ async function settleKnown(ctx: Ctx, row: SellerPayment, e: Expected, txHash: He
     // Never mined, or reverted, and nobody used the authorization: past the deadline it never can be.
     const code = done.code === E.SETTLEMENT_TIMEOUT ? E.EXPIRED : done.code;
     await refuseRow(ctx, row.claimKey, code);
-    return respond(ctx, code, req, price, statusFor(code));
+    return verdict('refused', code);
   }
   if (done.final) {
     await refuseRow(ctx, row.claimKey, done.code, done.txHash);
-    return respond(ctx, done.code, req, price, done.status);
+    return verdict('refused', done.code, done.status);
   }
-  return done.code === E.SUBMIT_FAILED ? respond(ctx, done.code, req, price, done.status) : respond(ctx, E.IN_PROGRESS, req);
+  return verdict('open', done.code, done.status);
+}
+
+/** A row with no known transaction: expire it if it can never settle, report it if used but untraceable. */
+async function untraced(ctx: Ctx, row: SellerPayment, e: Expected): Promise<Verdict | 'unsent'> {
+  const used = await ctx.deps.chain.authorizationState(e.asset, e.from, e.nonce);
+  if (!used && expired(ctx, row)) {
+    await refuseRow(ctx, row.claimKey, E.EXPIRED); // never sent, and now it never can be
+    return verdict('refused', E.EXPIRED);
+  }
+  if (!used) return 'unsent'; // still valid: only a request carrying the signature can send it
+  report(ctx, needsReconciliation(row.claimKey)); // a lagging or limited log index; reconcileOwed looks again
+  return verdict('open', E.IN_PROGRESS);
+}
+
+async function settleKnown(ctx: Ctx, row: SellerPayment, e: Expected, txHash: Hex, req: ReqLike, price: Price): Promise<AcceptResult> {
+  const v = await judge(ctx, row, e, txHash);
+  if (v.kind === 'settled') return deliverSettled(ctx, row.claimKey, req, price);
+  if (v.kind === 'refused' || v.code === E.SUBMIT_FAILED) return respond(ctx, v.code, req, price, v.status);
+  return respond(ctx, E.IN_PROGRESS, req);
 }
 
 /** A row that was never (knowingly) broadcast, its authorization still valid: send it now. The row stays open on any failure. */
@@ -362,16 +394,54 @@ async function resubmit(ctx: Ctx, row: SellerPayment, e: Expected, call: Transfe
   }
 }
 
-/** A row with no known transaction: expire it if it can never settle, report it if used but untraceable, else send it. */
+/** A row with no known transaction, on a retry: as `untraced`, but a still-valid unsent row is sent now. */
 async function withoutTransaction(ctx: Ctx, row: SellerPayment, e: Expected, call: TransferCall, req: ReqLike, price: Price): Promise<AcceptResult> {
-  const used = await ctx.deps.chain.authorizationState(e.asset, e.from, e.nonce);
-  if (!used && expired(ctx, row)) {
-    await refuseRow(ctx, row.claimKey, E.EXPIRED); // never sent, and now it never can be
-    return respond(ctx, E.EXPIRED, req, price);
+  const v = await untraced(ctx, row, e);
+  if (v === 'unsent') return resubmit(ctx, row, e, call, req, price);
+  return v.kind === 'refused' ? respond(ctx, v.code, req, price) : respond(ctx, E.IN_PROGRESS, req);
+}
+
+export interface ReconcileReport {
+  /** Open rows looked at (rows settled or refused meanwhile are skipped). */
+  readonly checked: number;
+  readonly settled: number;
+  readonly refused: number;
+  /** Still open: in progress here, unsent but valid, untraceable (reported), or the RPC failed (reported). */
+  readonly open: number;
+}
+
+async function reconcileRow(ctx: Ctx, row: SellerPayment): Promise<'settled' | 'refused' | 'open'> {
+  const e = expectedOfRow(row);
+  try {
+    const txHash = await txFor(ctx, row, e);
+    const v = txHash ? await judge(ctx, row, e, txHash) : await untraced(ctx, row, e);
+    return v === 'unsent' ? 'open' : v.kind;
+  } catch (error) {
+    report(ctx, error);
+    return 'open';
   }
-  if (!used) return resubmit(ctx, row, e, call, req, price);
-  report(ctx, needsReconciliation(row.claimKey)); // a lagging or limited log index; reconcileOwed resolves it
-  return respond(ctx, E.IN_PROGRESS, req);
+}
+
+/** Settles, expires or reports every open row without waiting for its payer to retry. */
+async function reconcileOwed(ctx: Ctx): Promise<ReconcileReport> {
+  const counts = { checked: 0, settled: 0, refused: 0, open: 0 };
+  for (const listed of await ctx.deps.ledger.list()) {
+    if (!isOpen(listed)) continue;
+    const row = await ctx.deps.ledger.get(listed.claimKey); // re-read: another process may have moved it
+    if (!row || !isOpen(row)) continue;
+    counts.checked += 1;
+    if (ctx.active.has(row.claimKey)) {
+      counts.open += 1; // a request here is settling it right now
+      continue;
+    }
+    ctx.active.add(row.claimKey);
+    try {
+      counts[await reconcileRow(ctx, row)] += 1;
+    } finally {
+      ctx.active.delete(row.claimKey);
+    }
+  }
+  return counts;
 }
 
 /**
@@ -602,6 +672,7 @@ export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
     reportError(error) {
       report(ctx, error);
     },
+    reconcileOwed: () => reconcileOwed(ctx),
     async idle() {
       while (ctx.background.size > 0) await Promise.all([...ctx.background]);
     },

@@ -23,13 +23,15 @@ function clientIp(headers: Readonly<Record<string, string>>, socketAddress: stri
   return candidate !== undefined && isIP(candidate) !== 0 ? candidate : socket;
 }
 
-/** Lower-cases header names and joins repeats, so a duplicated payment header fails strict parsing. */
-export function toReqLike(req: IncomingMessage, options: NodeHandlerOptions = {}): ReqLike {
+/**
+ * Lower-cases header names and joins repeats, so a duplicated payment header fails strict parsing.
+ * `url` defaults to req.url; a router that rewrites req.url passes the original one.
+ */
+export function toReqLike(req: IncomingMessage, options: NodeHandlerOptions = {}, url: string = req.url ?? '/'): ReqLike {
   const headers: Record<string, string> = {};
   for (const [name, value] of Object.entries(req.headers)) {
     if (value !== undefined) headers[name.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
   }
-  const url = req.url ?? '/';
   const q = url.indexOf('?');
   return {
     method: (req.method ?? 'GET').toUpperCase(),
@@ -40,7 +42,8 @@ export function toReqLike(req: IncomingMessage, options: NodeHandlerOptions = {}
   };
 }
 
-function internalError(res: ServerResponse): void {
+/** A bare 500 the payer can retry; never a settlement receipt, never the seller's error. */
+export function internalError(res: ServerResponse): void {
   if (res.headersSent) {
     res.destroy();
     return;
