@@ -10,7 +10,18 @@
     "skipLibCheck": true,
     "outDir": "dist",
     "rootDir": ".",
-    "types": ["node"]
+    "types": [
+      "node"
+    ],
+    "customConditions": [
+      "agentpay-source"
+    ]
   },
-  "include": ["src", "test", "examples"]
+  "include": [
+    "src",
+    "test",
+    "examples",
+    "packages/*/src",
+    "packages/*/test"
+  ]
 }
