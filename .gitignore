@@ -10,3 +10,7 @@ data/
 .reports/
 .claude/settings.local.json
 .DS_Store
+
+# Internal notes, never published
+PRODUCT-BRIEF.md
+.claude/plans/

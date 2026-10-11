@@ -11,7 +11,7 @@
       "default": "./dist/index.js"
     }
   },
-  "license": "MIT",
+  "license": "UNLICENSED",
   "dependencies": {
     "agentpay-hub": "file:../..",
     "viem": "^2.57.3"
