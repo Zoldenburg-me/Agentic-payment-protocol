@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
-import type { Acceptor, PaidContext, ReqLike } from '../accept.js';
+import type { PaidContext, PaymentHandler, ReqLike } from '../accept.js';
 import { AcceptError, AcceptErrorCode as E } from '../errors.js';
 
 export interface NodeHandlerOptions {
@@ -53,7 +53,7 @@ export function internalError(res: ServerResponse): void {
   res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'INTERNAL' }));
 }
 
-async function serve(acceptor: Acceptor, onPaid: OnPaid, options: NodeHandlerOptions, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function serve(acceptor: PaymentHandler, onPaid: OnPaid, options: NodeHandlerOptions, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const result = await acceptor.handle(toReqLike(req, options));
   if (result.kind === 'respond') {
     res.writeHead(result.status, result.headers).end(result.body);
@@ -70,7 +70,7 @@ async function serve(acceptor: Acceptor, onPaid: OnPaid, options: NodeHandlerOpt
 }
 
 /** A `node:http` request listener: answers 402s and refusals itself, calls `onPaid` once a payment is accepted. */
-export function nodeHandler(acceptor: Acceptor, onPaid: OnPaid, options: NodeHandlerOptions = {}) {
+export function nodeHandler(acceptor: PaymentHandler, onPaid: OnPaid, options: NodeHandlerOptions = {}) {
   return (req: IncomingMessage, res: ServerResponse): void => {
     serve(acceptor, onPaid, options, req, res).catch((error: unknown) => {
       acceptor.reportError(error);

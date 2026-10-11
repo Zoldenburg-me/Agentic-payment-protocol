@@ -1,5 +1,5 @@
 export { EXPIRY_GRACE_S, accept } from './accept.js';
-export type { AcceptDeps, AcceptResult, Acceptor, PaidContext, ReconcileReport, ReqLike } from './accept.js';
+export type { AcceptDeps, AcceptResult, Acceptor, HandleOptions, PaidContext, PaymentHandler, ReconcileReport, ReqLike } from './accept.js';
 export { parseAcceptOptions } from './config.js';
 export type { AcceptConfig, AcceptOptions, Price, PriceFn, PriceRequest } from './config.js';
 export { AcceptError, AcceptErrorCode, statusFor } from './errors.js';
@@ -22,3 +22,8 @@ export type { ViemSubmitterOptions } from './viem/submitter.js';
 export type { EstimateClient, ReadClient, SendClient } from './viem/clients.js';
 export { expressDeliveryErrors, expressPayment, paymentOf } from './adapters/express.js';
 export type { ExpressRequest, ExpressResponse } from './adapters/express.js';
+export { hostedSettle } from './hosted/server.js';
+export type { HostedSettleOptions, HostedSettleResult } from './hosted/server.js';
+export { zoldSeller } from './hosted/client.js';
+export type { ZoldSellerOptions } from './hosted/client.js';
+export type { SettleRequest, SettleResponse } from './hosted/wire.js';

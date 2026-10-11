@@ -14,7 +14,8 @@
     "mcp": "tsx src/mcp/server.ts",
     "demo": "tsx examples/demo.ts",
     "pay": "tsx examples/pay-url.ts",
-    "coverage": "c8 --check-coverage --lines 80 --branches 80 --functions 80 --include \"src/**\" --include \"packages/*/src/**\" --exclude \"src/mcp/server.ts\" --reporter text-summary --reporter text node --conditions=agentpay-source --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\" \"packages/*/test/**/*.test.ts\""
+    "coverage": "c8 --check-coverage --lines 80 --branches 80 --functions 80 --include \"src/**\" --include \"packages/*/src/**\" --exclude \"src/mcp/server.ts\" --reporter text-summary --reporter text node --conditions=agentpay-source --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\" \"packages/*/test/**/*.test.ts\"",
+    "prepack": "tsc -p tsconfig.build.json"
   },
   "license": "UNLICENSED",
   "dependencies": {
@@ -43,5 +44,9 @@
   },
   "workspaces": [
     "packages/*"
+  ],
+  "files": [
+    "dist",
+    "README.md"
   ]
 }
