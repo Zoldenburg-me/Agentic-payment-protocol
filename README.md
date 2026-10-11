@@ -105,3 +105,7 @@ add it to `DEFAULT_ADAPTERS`, and add a signer capability to `Wallet`.
 2. Test x402 against a live facilitator on Base Sepolia.
 3. x402 v1 (`X-PAYMENT` header, body-encoded requirements) for older servers.
 4. ACP / AP2 adapters once you have provider credentials to test against.
+
+---
+
+All rights reserved.
