@@ -237,9 +237,10 @@ describe('MemoryRateLimiter', () => {
     assert.equal(rl.take('k', 2, 60_000), true);
   });
 
-  it('fails closed when it is tracking too many keys', () => {
+  it('forgets the least recently used key when it is tracking too many', () => {
     const rl = new MemoryRateLimiter({ maxKeys: 1 });
-    assert.equal(rl.take('a', 5, 0), true);
-    assert.equal(rl.take('b', 5, 0), false);
+    assert.equal(rl.take('a', 1, 0), true);
+    assert.equal(rl.take('b', 1, 0), true);
+    assert.equal(rl.take('a', 1, 0), true, 'a was forgotten, so it starts a new window');
   });
 });

@@ -1,12 +1,14 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
 import type { Acceptor, PaidContext, ReqLike } from '../accept.js';
+import { AcceptError, AcceptErrorCode as E } from '../errors.js';
 
 export interface NodeHandlerOptions {
   /**
    * How many proxies you run in front of this server. The client is then the X-Forwarded-For
    * entry that many hops from the right (entries further left are client-controlled).
-   * Default 0: the socket address.
+   * Default 0: the socket address. With hops > 0 the origin must accept connections only from your
+   * proxies, or a client can write its own X-Forwarded-For entry and pick its rate-limit bucket.
    */
   readonly trustedProxyHops?: number;
 }
@@ -57,8 +59,9 @@ async function serve(acceptor: Acceptor, onPaid: OnPaid, options: NodeHandlerOpt
   for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
   try {
     await onPaid(req, res, result.paid);
-  } catch {
-    // The payment is recorded; the delivery failed. Never leak the seller's error to the payer.
+  } catch (error) {
+    // The payment is accepted; the delivery failed. The seller hears why; the payer gets a bare 500 and may retry.
+    acceptor.reportError(new AcceptError(E.DELIVERY_FAILED, `payment ${result.paid.claimKey} was accepted but its delivery failed`, { cause: error }));
     internalError(res);
   }
 }
@@ -66,7 +69,8 @@ async function serve(acceptor: Acceptor, onPaid: OnPaid, options: NodeHandlerOpt
 /** A `node:http` request listener: answers 402s and refusals itself, calls `onPaid` once a payment is accepted. */
 export function nodeHandler(acceptor: Acceptor, onPaid: OnPaid, options: NodeHandlerOptions = {}) {
   return (req: IncomingMessage, res: ServerResponse): void => {
-    serve(acceptor, onPaid, options, req, res).catch(() => {
+    serve(acceptor, onPaid, options, req, res).catch((error: unknown) => {
+      acceptor.reportError(error);
       try {
         internalError(res);
       } catch {

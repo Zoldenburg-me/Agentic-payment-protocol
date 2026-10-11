@@ -36,8 +36,8 @@ export class MemorySellerLedger implements SellerLedgerPort {
     return this.move(claimKey, 'settled', { txHash });
   }
 
-  async recordRefused(claimKey: string, code: AcceptErrorCode): Promise<SellerPayment> {
-    return this.move(claimKey, 'refused', { refusal: code });
+  async recordRefused(claimKey: string, code: AcceptErrorCode, txHash?: string): Promise<SellerPayment> {
+    return this.move(claimKey, 'refused', { refusal: code, ...(txHash !== undefined ? { txHash } : {}) });
   }
 
   async markDelivered(claimKey: string): Promise<{ first: boolean; row: SellerPayment }> {

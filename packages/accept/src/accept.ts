@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isIP } from 'node:net';
 import type { Hex } from 'viem';
 import { toUsdMicros } from 'agentpay-hub';
 import {
@@ -32,11 +33,17 @@ export interface PaidContext {
   readonly chainId: number;
   readonly asset: string;
   readonly nonce: string;
+  /** The method and path that were priced: serve exactly these. */
+  readonly method: string;
+  readonly path: string;
   /** Serve from this (as priced and paid), not from anything the request can still change. */
   readonly meta: Readonly<Record<string, string>>;
   /** False only for optimistic delivery: the transfer was sent but not yet confirmed. */
   readonly settled: boolean;
-  /** True when this is a retry of a payment that was already delivered. */
+  /**
+   * True when this payment was handed out for delivery before (a retry, perhaps after a failed
+   * delivery): serve the same resource again, keyed by claimKey, and repeat no side effects.
+   */
   readonly replayed: boolean;
 }
 
@@ -50,8 +57,9 @@ export interface AcceptDeps {
   readonly chain: ChainPort;
   readonly submitter: Submitter;
   /**
-   * Required: internal failures, ledger errors and optimistic deliveries that did not settle
-   * (an AcceptError with the code) all land here, since no request is left to answer them.
+   * Required: internal failures, ledger errors, ambiguous settlements and optimistic deliveries that
+   * did not settle (an AcceptError with the code) all land here, since no request is left to answer
+   * them. RPC errors arrive as the `cause` and may contain your RPC URL: redact before logging.
    */
   readonly onError: (error: unknown) => void;
   readonly rateLimiter?: RateLimiter;
@@ -61,6 +69,8 @@ export interface AcceptDeps {
 
 export interface Acceptor {
   handle(req: ReqLike): Promise<AcceptResult>;
+  /** Hands an error to `onError` (adapters use it for delivery failures). Never throws. */
+  reportError(error: unknown): void;
   /** Resolves once optimistic background settlements have finished. */
   idle(): Promise<void>;
 }
@@ -72,24 +82,36 @@ interface Ctx {
   readonly background: Set<Promise<void>>;
   /** Claim keys this process is settling right now (bounded by maxInFlight). */
   readonly active: Set<string>;
+  /** Per payer (lower-case): the value of its payments this process is still settling. */
+  readonly unsettled: Map<string, bigint>;
 }
 
 const READ_ONLY = new Set(['GET', 'HEAD']);
 const MAX_UINT256 = 2n ** 256n - 1n;
-const NETWORK = /^eip155:([1-9]\d{0,15})$/;
+const NETWORK = /^eip155:([1-9]\d{0,14})$/; // at most 15 digits: always a safe integer
 const RETRY_AFTER: Partial<Record<AcceptErrorCode, string>> = { [E.RATE_LIMITED]: '60', [E.IN_PROGRESS]: '1', [E.BUSY]: '1' };
 const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex');
 
+/** A failing error reporter must never take the payment path (or the process) down: warn, without its details. */
+const reporterFailed = (): void =>
+  process.emitWarning('@zold/accept: onError failed, so an error went unreported', { code: 'ZOLD_ACCEPT_ONERROR' });
+
 function report(ctx: Ctx, error: unknown): void {
   try {
-    ctx.deps.onError(error);
+    const result: unknown = ctx.deps.onError(error);
+    if (typeof (result as PromiseLike<unknown> | undefined)?.then === 'function') {
+      (result as PromiseLike<unknown>).then(undefined, reporterFailed);
+    }
   } catch {
-    // A failing error reporter must never take the payment path (or the process) down with it.
+    reporterFailed();
   }
 }
 
+/** Payment responses are per request and per payer: no shared cache may keep them. */
+const NO_STORE = { 'cache-control': 'no-store' } as const;
+
 function respond(ctx: Ctx, code: AcceptErrorCode, req: ReqLike, price?: Price, status = statusFor(code)): AcceptResult {
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...NO_STORE };
   // Every 402 carries a fresh offer, so the buyer can pay (again) without another round trip.
   if (status === 402 && price) headers['PAYMENT-REQUIRED'] = offerHeader(ctx.config, req.path, price.amount);
   const retryAfter = RETRY_AFTER[code];
@@ -97,9 +119,32 @@ function respond(ctx: Ctx, code: AcceptErrorCode, req: ReqLike, price?: Price, s
   return { kind: 'respond', status, headers, body: JSON.stringify({ error: code }) };
 }
 
-/** Origin-form only, no dot segments, no empty segments, no encoded dots or separators. */
+const PATH_CHARS = /^\/(?:[A-Za-z0-9\-._~!$&'()*+,=:@/]|%[0-9A-F]{2})*$/;
+/** Characters a router may decode to and match on: these must appear as themselves, never percent-encoded. */
+const PLAIN = /[A-Za-z0-9\-._~/\\]/;
+
+/**
+ * One spelling per path, so the path priced is the path the router serves: origin-form, RFC 3986
+ * characters without `;`, upper-case escapes only, none of unreserved characters or separators, no
+ * empty or dot segments. Case and trailing slashes still differ: price and route them the same way.
+ */
 function canonicalPath(path: string): boolean {
-  return /^\/[^\s?#\\]*$/.test(path) && !path.includes('//') && !/(^|\/)\.{1,2}(\/|$)/.test(path) && !/%(2e|2f|5c)/i.test(path);
+  if (!PATH_CHARS.test(path) || path.includes('//') || /(^|\/)\.{1,2}(\/|$)/.test(path)) return false;
+  return !(path.match(/%[0-9A-F]{2}/g) ?? []).some((e) => PLAIN.test(String.fromCharCode(parseInt(e.slice(1), 16))));
+}
+
+/** The rate-limit bucket for a client address: IPv6 per /64 (one subscriber), IPv4-mapped as IPv4. */
+export function ipBucket(ip: string): string {
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped?.[1] !== undefined) return mapped[1];
+  if (isIP(ip) !== 6) return ip;
+  const groups = (s: string): string[] => (s === '' ? [] : s.split(':'));
+  const width = (gs: string[]): number => gs.reduce((n, g) => n + (g.includes('.') ? 2 : 1), 0);
+  const [head = '', tail] = (ip.split('%')[0] ?? '').split('::');
+  const before = groups(head);
+  const after = tail === undefined ? [] : groups(tail);
+  const all = [...before, ...Array<string>(tail === undefined ? 0 : 8 - width(before) - width(after)).fill('0'), ...after];
+  return `${all.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(':')}::/64`;
 }
 
 const isStringRecord = (v: unknown): v is Record<string, string> =>
@@ -139,8 +184,10 @@ function claimedKey(config: AcceptConfig, sig: PaymentSignature): string | undef
   }
 }
 
+const byKey = (m: Readonly<Record<string, string>>): [string, string][] =>
+  Object.entries(m).sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
 const sameMeta = (a: Readonly<Record<string, string>>, b: Readonly<Record<string, string>>): boolean =>
-  JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
+  JSON.stringify(byKey(a)) === JSON.stringify(byKey(b));
 
 /** A replay must be the same payment for the same thing: header, method, path, query, price and meta. */
 const sameRequest = (row: SellerPayment, digest: string, req: ReqLike, price: Price): boolean =>
@@ -148,12 +195,15 @@ const sameRequest = (row: SellerPayment, digest: string, req: ReqLike, price: Pr
   row.amount === price.amount.toString() && sameMeta(row.meta, price.meta ?? {});
 
 function paidResult(ctx: Ctx, row: SellerPayment, settled: boolean, replayed: boolean): AcceptResult {
+  // The settlement receipt only once there is a settlement: an optimistic delivery has none yet.
+  const receipt: Record<string, string> = settled ? { 'PAYMENT-RESPONSE': paymentResponseHeader(ctx.config, row.txHash, row.payer) } : {};
   return {
     kind: 'paid',
-    headers: { 'PAYMENT-RESPONSE': paymentResponseHeader(ctx.config, row.txHash, row.payer) },
+    headers: { ...NO_STORE, ...receipt },
     paid: {
       claimKey: row.claimKey, protocol: 'x402', payer: row.payer, amount: BigInt(row.amount), txHash: row.txHash,
-      chainId: row.chainId, asset: row.asset, nonce: row.nonce, meta: row.meta, settled, replayed,
+      chainId: row.chainId, asset: row.asset, nonce: row.nonce, method: row.method, path: row.path, meta: row.meta,
+      settled, replayed,
     },
   };
 }
@@ -176,10 +226,10 @@ async function settleRow(ctx: Ctx, claimKey: string, txHash: string): Promise<vo
   }
 }
 
-async function refuseRow(ctx: Ctx, claimKey: string, code: AcceptErrorCode): Promise<void> {
+async function refuseRow(ctx: Ctx, claimKey: string, code: AcceptErrorCode, txHash?: string): Promise<void> {
   if (!isOpen(await ctx.deps.ledger.get(claimKey))) return;
   try {
-    await ctx.deps.ledger.recordRefused(claimKey, code);
+    await ctx.deps.ledger.recordRefused(claimKey, code, txHash);
   } catch (error) {
     if (isOpen(await ctx.deps.ledger.get(claimKey))) throw error;
   }
@@ -201,8 +251,8 @@ export const EXPIRY_GRACE_S = 120;
 const expired = (ctx: Ctx, row: SellerPayment): boolean =>
   BigInt(Math.floor(ctx.deps.now() / 1000)) >= BigInt(row.validBefore) + BigInt(EXPIRY_GRACE_S);
 
-const expectedOfRow = (ctx: Ctx, row: SellerPayment): Expected =>
-  ({ asset: row.asset, from: row.payer, to: ctx.config.payTo, value: BigInt(row.amount), nonce: row.nonce as Hex });
+const expectedOfRow = (row: SellerPayment): Expected =>
+  ({ asset: row.asset, from: row.payer, to: row.payTo, value: BigInt(row.amount), nonce: row.nonce as Hex });
 
 /** Our transaction if we sent one (confirm follows a front-runner from it), else whichever used the authorization. */
 async function txFor(ctx: Ctx, row: SellerPayment, e: Expected): Promise<Hex | undefined> {
@@ -212,62 +262,155 @@ async function txFor(ctx: Ctx, row: SellerPayment, e: Expected): Promise<Hex | u
 const needsReconciliation = (claimKey: string): AcceptError =>
   new AcceptError(E.SETTLEMENT_UNKNOWN, `payment ${claimKey} is used on chain but its transaction cannot be found: reconcile`);
 
-/** A row with no known transaction: expire it if it can never settle, report it if it is used but untraceable. */
-async function withoutTransaction(ctx: Ctx, row: SellerPayment, e: Expected, req: ReqLike, price: Price): Promise<AcceptResult> {
+/** What onError should hear about a settlement failure; undefined for an ordinary, self-explaining one. */
+function failureReport(claimKey: string, f: SettleFailure): AcceptError | undefined {
+  if (f.code === E.SETTLEMENT_UNKNOWN) return needsReconciliation(claimKey);
+  if (f.code === E.AUTHORIZATION_USED) {
+    // Used or cancelled with no transaction found: if it was used, the seller may have been paid.
+    return new AcceptError(E.AUTHORIZATION_USED, `payment ${claimKey} is used or cancelled on chain with no transaction found: check`);
+  }
+  if (f.code === E.TRANSFER_MISMATCH) {
+    return new AcceptError(E.TRANSFER_MISMATCH, `payment ${claimKey}: transaction ${f.txHash ?? '?'} succeeded without the expected transfer: check`);
+  }
+  // A call failed (transport, RPC), so whether money moved is unknown until a retry or reconcileOwed looks again.
+  return f.cause === undefined ? undefined : new AcceptError(f.code, `payment ${claimKey}: ${f.code}`, { cause: f.cause });
+}
+
+function reportFailure(ctx: Ctx, claimKey: string, f: SettleFailure): void {
+  const error = failureReport(claimKey, f);
+  if (error) report(ctx, error);
+}
+
+/** Holds the payer's value while its payment settles, so the next one is checked against what is left. */
+interface Hold {
+  /** What the payer already had unsettled here before this payment. */
+  readonly prior: bigint;
+  readonly release: () => void;
+}
+
+function hold(ctx: Ctx, payer: string, value: bigint): Hold {
+  const key = payer.toLowerCase();
+  const prior = ctx.unsettled.get(key) ?? 0n;
+  ctx.unsettled.set(key, prior + value);
+  let held = true;
+  return {
+    prior,
+    release: () => {
+      if (!held) return;
+      held = false;
+      const left = (ctx.unsettled.get(key) ?? 0n) - value;
+      if (left > 0n) ctx.unsettled.set(key, left);
+      else ctx.unsettled.delete(key);
+    },
+  };
+}
+
+/** After a broadcast the money may move: a failed ledger write must not stop us confirming it. */
+async function recordSubmitted(ctx: Ctx, claimKey: string, txHash: Hex): Promise<void> {
+  try {
+    await ctx.deps.ledger.recordSubmitted(claimKey, txHash);
+  } catch (error) {
+    report(ctx, new AcceptError(E.INTERNAL, `payment ${claimKey} was broadcast as ${txHash} but recording it failed`, { cause: error }));
+  }
+}
+
+/** Confirms a known transaction for an existing row. Final only past the deadline, and only if the authorization is unused. */
+async function settleKnown(ctx: Ctx, row: SellerPayment, e: Expected, txHash: Hex, req: ReqLike, price: Price): Promise<AcceptResult> {
+  const done = await confirm(ctx.env, e, txHash);
+  if (done.ok) {
+    await settleRow(ctx, row.claimKey, done.txHash);
+    return deliverSettled(ctx, row.claimKey, req, price);
+  }
+  reportFailure(ctx, row.claimKey, done);
+  const unusedNow = (): Promise<boolean> =>
+    ctx.deps.chain.authorizationState(e.asset, e.from, e.nonce).then((used) => !used, () => false);
+  if ((done.code === E.SETTLEMENT_TIMEOUT || done.code === E.SUBMIT_FAILED) && expired(ctx, row) && await unusedNow()) {
+    // Never mined, or reverted, and nobody used the authorization: past the deadline it never can be.
+    const code = done.code === E.SETTLEMENT_TIMEOUT ? E.EXPIRED : done.code;
+    await refuseRow(ctx, row.claimKey, code);
+    return respond(ctx, code, req, price, statusFor(code));
+  }
+  if (done.final) {
+    await refuseRow(ctx, row.claimKey, done.code, done.txHash);
+    return respond(ctx, done.code, req, price, done.status);
+  }
+  return done.code === E.SUBMIT_FAILED ? respond(ctx, done.code, req, price, done.status) : respond(ctx, E.IN_PROGRESS, req);
+}
+
+/** A row that was never (knowingly) broadcast, its authorization still valid: send it now. The row stays open on any failure. */
+async function resubmit(ctx: Ctx, row: SellerPayment, e: Expected, call: TransferCall, req: ReqLike, price: Price): Promise<AcceptResult> {
+  const held = hold(ctx, row.payer, e.value);
+  try {
+    const pre = await precheck(ctx.env, call, held.prior);
+    if (!pre.ok) {
+      reportFailure(ctx, row.claimKey, pre);
+      return respond(ctx, pre.code, req, price, pre.status); // never released or refused: the payer may still fund it
+    }
+    let txHash = pre.existing;
+    if (txHash === undefined) {
+      const sent = await submit(ctx.env, call);
+      if (!sent.ok) {
+        reportFailure(ctx, row.claimKey, sent);
+        return respond(ctx, sent.code, req, price, sent.status);
+      }
+      txHash = sent.txHash;
+      if (sent.ours) await recordSubmitted(ctx, row.claimKey, txHash);
+    }
+    return await settleKnown(ctx, row, e, txHash, req, price);
+  } finally {
+    held.release();
+  }
+}
+
+/** A row with no known transaction: expire it if it can never settle, report it if used but untraceable, else send it. */
+async function withoutTransaction(ctx: Ctx, row: SellerPayment, e: Expected, call: TransferCall, req: ReqLike, price: Price): Promise<AcceptResult> {
   const used = await ctx.deps.chain.authorizationState(e.asset, e.from, e.nonce);
   if (!used && expired(ctx, row)) {
     await refuseRow(ctx, row.claimKey, E.EXPIRED); // never sent, and now it never can be
     return respond(ctx, E.EXPIRED, req, price);
   }
-  if (used) report(ctx, needsReconciliation(row.claimKey)); // a lagging or limited log index; reconcileOwed resolves it
+  if (!used) return resubmit(ctx, row, e, call, req, price);
+  report(ctx, needsReconciliation(row.claimKey)); // a lagging or limited log index; reconcileOwed resolves it
   return respond(ctx, E.IN_PROGRESS, req);
 }
 
 /**
  * An owed or submitted row whose outcome was unknown, or whose own transaction reverted while the
- * authorization stayed valid: look at the chain again. It becomes final only once validBefore has passed.
+ * authorization stayed valid: look at the chain again. `call` is rebuilt from the retry's header,
+ * which is byte-identical to the one verified (its digest matched), so a stranded row can be sent.
  */
-async function resume(ctx: Ctx, row: SellerPayment, req: ReqLike, price: Price): Promise<AcceptResult> {
-  const e = expectedOfRow(ctx, row);
+async function resume(ctx: Ctx, row: SellerPayment, call: TransferCall, req: ReqLike, price: Price): Promise<AcceptResult> {
+  const e = expectedOfRow(row);
   ctx.active.add(row.claimKey);
   try {
     let txHash: Hex | undefined;
     try {
       txHash = await txFor(ctx, row, e);
-      if (!txHash) return await withoutTransaction(ctx, row, e, req, price);
+      if (!txHash) return await withoutTransaction(ctx, row, e, call, req, price);
     } catch (error) {
       report(ctx, error); // an RPC or ledger failure: the row stays open, but nobody should have to guess why
       return respond(ctx, E.IN_PROGRESS, req);
     }
-    const done = await confirm(ctx.env, e, txHash);
-    if (done.ok) {
-      await settleRow(ctx, row.claimKey, done.txHash);
-      return await deliverSettled(ctx, row.claimKey, req, price);
-    }
-    if (done.code === E.SETTLEMENT_TIMEOUT && expired(ctx, row)) {
-      // Our transaction never mined and nobody else used the authorization: past the deadline it never can be.
-      const expiredUnused = await ctx.deps.chain.authorizationState(e.asset, e.from, e.nonce).then((used) => !used, () => false);
-      if (expiredUnused) {
-        await refuseRow(ctx, row.claimKey, E.EXPIRED);
-        return respond(ctx, E.EXPIRED, req, price);
-      }
-    }
-    if (done.code === E.SETTLEMENT_UNKNOWN) report(ctx, needsReconciliation(row.claimKey));
-    // A revert is final only past the deadline, and only if the authorization is still unused right now.
-    const revertedForGood = done.code === E.SUBMIT_FAILED && expired(ctx, row) &&
-      await ctx.deps.chain.authorizationState(e.asset, e.from, e.nonce).then((used) => !used, () => false);
-    if (done.final || revertedForGood) {
-      await refuseRow(ctx, row.claimKey, done.code);
-      return respond(ctx, done.code, req, price, done.status);
-    }
-    return done.code === E.SUBMIT_FAILED ? respond(ctx, done.code, req, price, done.status) : respond(ctx, E.IN_PROGRESS, req);
+    return await settleKnown(ctx, row, e, txHash, req, price);
   } finally {
     ctx.active.delete(row.claimKey);
   }
 }
 
+/** The transfer a header authorizes, against a stored row (the header was verified when the row was written). */
+function callOf(row: SellerPayment, sig: PaymentSignature): TransferCall {
+  const a = sig.payload.authorization as Record<string, unknown>;
+  return {
+    asset: row.asset, signature: sig.payload.signature as Hex,
+    authorization: {
+      from: row.payer as Hex, to: row.payTo as Hex, value: BigInt(row.amount), validAfter: BigInt(String(a.validAfter)),
+      validBefore: BigInt(row.validBefore), nonce: row.nonce as Hex,
+    },
+  };
+}
+
 /** A payment this seller has seen before: repeat the refusal, replay a delivery, or resume an unknown outcome. */
-async function fromExisting(ctx: Ctx, row: SellerPayment, digest: string, req: ReqLike, price: Price): Promise<AcceptResult> {
+async function fromExisting(ctx: Ctx, row: SellerPayment, sig: PaymentSignature, digest: string, req: ReqLike, price: Price): Promise<AcceptResult> {
   if (!sameRequest(row, digest, req, price)) return respond(ctx, E.NONCE_REPLAY, req);
   if (row.status === 'refused') return respond(ctx, row.refusal ?? E.INTERNAL, req, price);
   if (row.status === 'settled') return deliver(ctx, row.claimKey, true);
@@ -276,13 +419,14 @@ async function fromExisting(ctx: Ctx, row: SellerPayment, digest: string, req: R
   if (ctx.active.size >= ctx.config.maxInFlight) return respond(ctx, E.BUSY, req);
   // Resuming polls the chain: it spends the (verified, stored) payer's bucket, not just the IP's.
   if (!take(ctx, `payer:${row.payer.toLowerCase()}`, ctx.config.rateLimit.perPayerPerMinute)) return respond(ctx, E.RATE_LIMITED, req);
-  return resume(ctx, row, req, price);
+  return resume(ctx, row, callOf(row, sig), req, price);
 }
 
-function optimistic(ctx: Ctx, req: ReqLike, amount: bigint): boolean {
+function optimistic(ctx: Ctx, s: Settling): boolean {
   const max = ctx.config.optimisticMaxUsdMicros;
-  if (max === undefined || !READ_ONLY.has(req.method.toUpperCase())) return false;
-  const usd = toUsdMicros({ atomic: amount, asset: ctx.config.asset, network: ctx.config.network }, ctx.config.assets);
+  // Never while the payer has anything else unsettled here: the $0.50 cap is per payer, not per payment.
+  if (max === undefined || s.held.prior > 0n || !READ_ONLY.has(s.req.method.toUpperCase())) return false;
+  const usd = toUsdMicros({ atomic: s.price.amount, asset: ctx.config.asset, network: ctx.config.network }, ctx.config.assets);
   return usd !== undefined && usd <= max;
 }
 
@@ -292,15 +436,13 @@ interface Settling {
   readonly e: Expected;
   readonly claimKey: string;
   readonly claim: PaymentClaim;
+  readonly held: Hold;
 }
 
+/** A failure before the row is written may free the claim; after it, only reconciliation or a retry moves the row. */
 async function refuse(ctx: Ctx, s: Settling, f: SettleFailure): Promise<AcceptResult> {
-  if (f.code === E.SETTLEMENT_UNKNOWN) report(ctx, needsReconciliation(s.claimKey));
-  if (f.code === E.AUTHORIZATION_USED) {
-    // Used or cancelled with no transaction found: if it was used, the seller may have been paid.
-    report(ctx, new AcceptError(E.AUTHORIZATION_USED, `payment ${s.claimKey} is used or cancelled on chain with no transaction found: check`));
-  }
-  if (f.final) await refuseRow(ctx, s.claimKey, f.code);
+  reportFailure(ctx, s.claimKey, f);
+  if (f.final) await refuseRow(ctx, s.claimKey, f.code, f.txHash);
   if (f.release) await releasePayment(ctx.deps.claims, s.claim);
   return respond(ctx, f.code, s.req, s.price, f.status);
 }
@@ -309,17 +451,20 @@ async function finishInBackground(ctx: Ctx, s: Settling, txHash: Hex): Promise<v
   try {
     const done = await confirm(ctx.env, s.e, txHash);
     if (done.ok) return await settleRow(ctx, s.claimKey, done.txHash);
-    if (done.final) await refuseRow(ctx, s.claimKey, done.code);
-    if (done.release) await releasePayment(ctx.deps.claims, s.claim);
-    report(ctx, new AcceptError(done.code, 'an optimistically delivered payment did not settle'));
+    if (done.final) await refuseRow(ctx, s.claimKey, done.code, done.txHash);
+    // confirm never frees a claim: the row exists, so the claim stays with it.
+    report(ctx, failureReport(s.claimKey, done) ?? new AcceptError(done.code, 'an optimistically delivered payment did not settle'));
   } finally {
     ctx.active.delete(s.claimKey);
+    s.held.release();
   }
 }
 
+type Outcome = { readonly result: AcceptResult; readonly handedOff: boolean } | { readonly existing: SellerPayment };
+
 /** Steps 8–9: confirm (or hand off to the background when optimistic), then deliver once. */
-async function confirmAndDeliver(ctx: Ctx, s: Settling, txHash: Hex, ours: boolean): Promise<{ result: AcceptResult; handedOff: boolean }> {
-  if (ours && optimistic(ctx, s.req, s.price.amount)) {
+async function confirmAndDeliver(ctx: Ctx, s: Settling, txHash: Hex, ours: boolean): Promise<Outcome> {
+  if (ours && optimistic(ctx, s)) {
     // Deliver first: if that throws, no background task holds the slot behind our back.
     const result = await deliver(ctx, s.claimKey, false);
     const work: Promise<void> = finishInBackground(ctx, s, txHash).catch((error) => report(ctx, error)).finally(() => ctx.background.delete(work));
@@ -333,8 +478,8 @@ async function confirmAndDeliver(ctx: Ctx, s: Settling, txHash: Hex, ours: boole
 }
 
 /** Steps 6–9 for a claimed payment: pre-checks, the `owed` row, broadcast, confirmation, delivery. */
-async function settleNew(ctx: Ctx, s: Settling, call: TransferCall, row: NewSellerPayment): Promise<{ result: AcceptResult; handedOff: boolean }> {
-  const pre = await precheck(ctx.env, call);
+async function settleNew(ctx: Ctx, s: Settling, call: TransferCall, row: NewSellerPayment): Promise<Outcome> {
+  const pre = await precheck(ctx.env, call, s.held.prior);
   if (!pre.ok) return { result: await refuse(ctx, s, pre), handedOff: false }; // nothing written, nothing sent
   let recorded;
   try {
@@ -345,13 +490,12 @@ async function settleNew(ctx: Ctx, s: Settling, call: TransferCall, row: NewSell
   }
   if (!recorded.created) {
     await releasePayment(ctx.deps.claims, s.claim);
-    ctx.active.delete(s.claimKey);
-    return { result: await fromExisting(ctx, recorded.row, row.headerDigest, s.req, s.price), handedOff: false };
+    return { existing: recorded.row }; // the caller gives up its slot first, then treats it as seen before
   }
   if (pre.existing) return confirmAndDeliver(ctx, s, pre.existing, false); // front-run: settle from theirs
   const sent = await submit(ctx.env, call);
   if (!sent.ok) return { result: await refuse(ctx, s, sent), handedOff: false };
-  if (sent.ours) await ctx.deps.ledger.recordSubmitted(s.claimKey, sent.txHash);
+  if (sent.ours) await recordSubmitted(ctx, s.claimKey, sent.txHash);
   return confirmAndDeliver(ctx, s, sent.txHash, sent.ours);
 }
 
@@ -382,7 +526,7 @@ async function verifyAndClaim(ctx: Ctx, req: ReqLike, price: Price, sig: Payment
   if (!claimed.ok) {
     ctx.active.delete(claimKey);
     const row = claimed.code === E.NONCE_REPLAY ? await deps.ledger.get(claimKey) : undefined;
-    return row ? fromExisting(ctx, row, digest, req, price) : respond(ctx, claimed.code, req, price);
+    return row ? fromExisting(ctx, row, sig, digest, req, price) : respond(ctx, claimed.code, req, price);
   }
   const call: TransferCall = {
     asset: config.asset, signature: sig.payload.signature as Hex,
@@ -390,17 +534,21 @@ async function verifyAndClaim(ctx: Ctx, req: ReqLike, price: Price, sig: Payment
   };
   const row: NewSellerPayment = {
     claimKey, sellerAccountId: config.sellerAccountId, protocol: 'x402', chainId: config.chainId, asset: config.asset,
-    payer: v.payer, nonce: v.nonce, amount: price.amount.toString(), validBefore: v.validBefore.toString(),
+    payer: v.payer, nonce: v.nonce, amount: price.amount.toString(), payTo: config.payTo, validBefore: v.validBefore.toString(),
     method: req.method, path: req.path, queryDigest: sha256(req.query), headerDigest: digest, meta: price.meta ?? {},
   };
-  let handedOff = false;
+  const held = hold(ctx, v.payer, v.value);
+  let out: Outcome | undefined;
   try {
-    const out = await settleNew(ctx, { req, price, e: expectedOf(call), claimKey, claim: claimed.claim }, call, row);
-    handedOff = out.handedOff;
-    return out.result;
+    out = await settleNew(ctx, { req, price, e: expectedOf(call), claimKey, claim: claimed.claim, held }, call, row);
   } finally {
-    if (!handedOff) ctx.active.delete(claimKey);
+    // This call owns the slot and the hold until it hands them to the background; it releases them exactly once.
+    if (out === undefined || !('handedOff' in out) || !out.handedOff) {
+      ctx.active.delete(claimKey);
+      held.release();
+    }
   }
+  return 'existing' in out ? fromExisting(ctx, out.existing, sig, digest, req, price) : out.result;
 }
 
 /** Steps 1–3: canonical path, price (headers only), strict parsing, IP rate limit; then an earlier payment or a new one. */
@@ -421,12 +569,12 @@ async function handlePayment(ctx: Ctx, req: ReqLike): Promise<AcceptResult> {
   if (price.contentLength !== undefined && req.headers['content-length'] !== String(price.contentLength)) {
     return respond(ctx, E.PRICE_MISMATCH, req);
   }
-  if (!take(ctx, `ip:${req.clientIp}`, ctx.config.rateLimit.perIpPerMinute)) return respond(ctx, E.RATE_LIMITED, req);
+  if (!take(ctx, `ip:${ipBucket(req.clientIp)}`, ctx.config.rateLimit.perIpPerMinute)) return respond(ctx, E.RATE_LIMITED, req);
 
   const digest = sha256(header);
   const key = claimedKey(ctx.config, sig);
   const prior = key === undefined ? undefined : await ctx.deps.ledger.get(key);
-  if (prior) return fromExisting(ctx, prior, digest, req, price);
+  if (prior) return fromExisting(ctx, prior, sig, digest, req, price);
   return verifyAndClaim(ctx, req, price, sig, digest);
 }
 
@@ -439,7 +587,7 @@ export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
     ...deps, sleep, rateLimiter: deps.rateLimiter ?? new MemoryRateLimiter(), now: deps.now ?? Date.now,
   };
   const ctx: Ctx = {
-    config, deps: resolved, background: new Set(), active: new Set(),
+    config, deps: resolved, background: new Set(), active: new Set(), unsettled: new Map(),
     env: { config, chain: deps.chain, submitter: deps.submitter, sleep },
   };
   return {
@@ -450,6 +598,9 @@ export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
         report(ctx, error);
         return respond(ctx, E.INTERNAL, req);
       }
+    },
+    reportError(error) {
+      report(ctx, error);
     },
     async idle() {
       while (ctx.background.size > 0) await Promise.all([...ctx.background]);

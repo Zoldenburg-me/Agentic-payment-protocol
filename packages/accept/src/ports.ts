@@ -58,7 +58,7 @@ export interface Submitter {
 }
 
 export interface RateLimiter {
-  /** Takes one unit for `key`; false when `limit` per minute is used up (or the limiter is full). */
+  /** Takes one unit for `key`; false when `limit` per minute is used up. */
   take(key: string, limit: number, nowMs: number): boolean;
 }
 
@@ -74,6 +74,8 @@ export interface NewSellerPayment {
   readonly payer: string;
   readonly nonce: string;
   readonly amount: string;
+  /** The payee this payment was verified for; a later payTo change does not apply to it. */
+  readonly payTo: string;
   readonly validBefore: string;
   readonly method: string;
   readonly path: string;
@@ -82,7 +84,7 @@ export interface NewSellerPayment {
    * digest is stored, because query strings often carry personal data (e.g. `?email=`).
    */
   readonly queryDigest: string;
-  /** sha256 of the canonical PAYMENT-SIGNATURE header: identifies a retry of the same payment. */
+  /** sha256 of the PAYMENT-SIGNATURE header exactly as sent: a retry must resend it byte for byte. */
   readonly headerDigest: string;
   readonly meta: Readonly<Record<string, string>>;
 }
@@ -107,7 +109,8 @@ export interface SellerLedgerPort {
   recordVerified(row: NewSellerPayment): Promise<{ readonly created: boolean; readonly row: SellerPayment }>;
   recordSubmitted(claimKey: string, txHash: string): Promise<SellerPayment>;
   recordSettled(claimKey: string, txHash: string): Promise<SellerPayment>;
-  recordRefused(claimKey: string, code: AcceptErrorCode): Promise<SellerPayment>;
+  /** `txHash` is kept when a mined transaction was refused (e.g. TRANSFER_MISMATCH), for reconciliation. */
+  recordRefused(claimKey: string, code: AcceptErrorCode, txHash?: string): Promise<SellerPayment>;
   /** Sets the delivery flag; `first` is false if it was already set. */
   markDelivered(claimKey: string): Promise<{ readonly first: boolean; readonly row: SellerPayment }>;
 }

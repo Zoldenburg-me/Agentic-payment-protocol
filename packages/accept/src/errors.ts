@@ -20,6 +20,8 @@ export const AcceptErrorCode = {
   INTERNAL: 'INTERNAL',
   BUSY: 'BUSY',
   SETTLEMENT_UNKNOWN: 'SETTLEMENT_UNKNOWN',
+  /** Reported only (never a response code): the payment was accepted, then the seller's delivery threw. */
+  DELIVERY_FAILED: 'DELIVERY_FAILED',
 } as const;
 
 export type AcceptErrorCode = (typeof AcceptErrorCode)[keyof typeof AcceptErrorCode];
@@ -28,8 +30,8 @@ export type AcceptErrorCode = (typeof AcceptErrorCode)[keyof typeof AcceptErrorC
 export class AcceptError extends Error {
   readonly code: AcceptErrorCode;
 
-  constructor(code: AcceptErrorCode, message: string = code) {
-    super(message);
+  constructor(code: AcceptErrorCode, message: string = code, options?: { readonly cause?: unknown }) {
+    super(message, options);
     this.name = 'AcceptError';
     this.code = code;
   }
@@ -41,7 +43,7 @@ const STATUS: Readonly<Partial<Record<AcceptErrorCode, number>>> = {
   [E.BOTH_HEADERS]: 400, [E.PRICE_INVALID]: 400, [E.PRICE_MISMATCH]: 400,
   [E.NONCE_REPLAY]: 409, [E.IN_PROGRESS]: 409,
   [E.RATE_LIMITED]: 429,
-  [E.PRICE_ERROR]: 500, [E.CONFIG_INVALID]: 500, [E.LEDGER_TRANSITION]: 500, [E.INTERNAL]: 500,
+  [E.PRICE_ERROR]: 500, [E.CONFIG_INVALID]: 500, [E.LEDGER_TRANSITION]: 500, [E.INTERNAL]: 500, [E.DELIVERY_FAILED]: 500,
   [E.ASSET_DOMAIN_UNPINNED]: 500, [E.DOMAIN_MISMATCH]: 500,
   [E.SUBMIT_FAILED]: 502, [E.TRANSFER_MISMATCH]: 502,
   [E.RPC_UNAVAILABLE]: 503, [E.SETTLEMENT_TIMEOUT]: 503, [E.STORE_FULL]: 503, [E.BUSY]: 503, [E.SETTLEMENT_UNKNOWN]: 503,

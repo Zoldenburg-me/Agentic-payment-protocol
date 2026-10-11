@@ -21,7 +21,11 @@ export interface Price {
   readonly contentLength?: number;
 }
 
-/** Synchronous and header-only. Throw on bad request headers (400); return garbage and it is a 500. */
+/**
+ * Synchronous and header-only. Throw on bad request headers (400); return garbage and it is a 500.
+ * Deterministic per (method, path, headers) for the life of a payment: a retry is only delivered if it
+ * prices the same, so time- or load-based prices refuse paid retries as NONCE_REPLAY.
+ */
 export type PriceFn = (req: PriceRequest) => Price;
 
 export interface AcceptOptions {

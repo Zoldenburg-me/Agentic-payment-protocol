@@ -5,7 +5,7 @@ import { CHAIN_ID, PAY_TO, USDC } from './helpers.js';
 
 const row = (claimKey = 'k1'): NewSellerPayment => ({
   claimKey, sellerAccountId: 'seller-1', protocol: 'x402', chainId: CHAIN_ID, asset: USDC, payer: PAY_TO,
-  nonce: `0x${'11'.repeat(32)}`, amount: '10000', validBefore: '1800000120', method: 'GET', path: '/rates', queryDigest: '',
+  nonce: `0x${'11'.repeat(32)}`, amount: '10000', payTo: PAY_TO, validBefore: '1800000120', method: 'GET', path: '/rates', queryDigest: '',
   headerDigest: 'd1', meta: {},
 });
 const TX = `0x${'aa'.repeat(32)}` as const;

@@ -8,7 +8,11 @@ interface Window {
   readonly count: number;
 }
 
-/** Fixed one-minute windows per key. When too many keys are live it refuses (fails closed). */
+/**
+ * Fixed one-minute windows per key, for one process. When it tracks too many keys it forgets the
+ * least recently used one, so a flood of new keys resets old counts instead of locking everyone out.
+ * Run several processes and you need a shared limiter.
+ */
 export class MemoryRateLimiter implements RateLimiter {
   private readonly windows = new Map<string, Window>();
   private readonly maxKeys: number;
@@ -20,17 +24,19 @@ export class MemoryRateLimiter implements RateLimiter {
   take(key: string, limit: number, nowMs: number): boolean {
     const current = this.windows.get(key);
     const live = current !== undefined && nowMs - current.start < WINDOW_MS;
-    if (!current && this.windows.size >= this.maxKeys) {
-      this.evictExpired(nowMs);
-      if (this.windows.size >= this.maxKeys) return false;
-    }
     const next: Window = live ? { start: current.start, count: current.count + 1 } : { start: nowMs, count: 1 };
-    if (next.count > limit) return false;
+    this.windows.delete(key); // re-inserted below, so Map order is least recently used first
+    if (next.count > limit) {
+      this.windows.set(key, current ?? next);
+      return false;
+    }
+    if (this.windows.size >= this.maxKeys) this.evictOldest();
     this.windows.set(key, next);
     return true;
   }
 
-  private evictExpired(nowMs: number): void {
-    for (const [key, w] of this.windows) if (nowMs - w.start >= WINDOW_MS) this.windows.delete(key);
+  private evictOldest(): void {
+    const oldest = this.windows.keys().next();
+    if (!oldest.done) this.windows.delete(oldest.value);
   }
 }

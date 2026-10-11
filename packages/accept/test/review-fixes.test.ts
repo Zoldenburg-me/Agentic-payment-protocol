@@ -93,10 +93,19 @@ describe('retries resume payments whose outcome was unknown', () => {
     assert.equal(again.kind, 'paid');
   });
 
-  it('an owed payment with no transaction on chain stays in progress', async () => {
+  it('an owed payment never sent (transport failed first) is sent on retry', async () => {
     const s = setup();
     const header = await payHeader(s.buyer);
     s.chain.failNextSubmitTransport = true;
+    assert.equal(codeOf(await s.acceptor.handle(s.req(paid(header)))), E.SUBMIT_FAILED);
+    assert.equal(s.chain.submissions.length, 0);
+    const again = await s.acceptor.handle(s.req(paid(header)));
+    assert.ok(again.kind === 'paid' && again.paid.settled);
+  });
+
+  it('a payment still confirming answers IN_PROGRESS with Retry-After', async () => {
+    const s = setup({ settlementTimeoutMs: 5 }, { autoMine: false });
+    const header = await payHeader(s.buyer);
     await s.acceptor.handle(s.req(paid(header)));
     const again = await s.acceptor.handle(s.req(paid(header)));
     assert.equal(again.kind === 'respond' && again.status, 409);
@@ -372,10 +381,9 @@ describe('security-review gaps', () => {
   });
 
   it('resuming a payment spends the verified payer\'s rate-limit bucket', async () => {
-    const s = setup({ rateLimit: { perIpPerMinute: 100, perPayerPerMinute: 2 } });
+    const s = setup({ rateLimit: { perIpPerMinute: 100, perPayerPerMinute: 2 }, settlementTimeoutMs: 5 }, { autoMine: false });
     const header = await payHeader(s.buyer);
-    s.chain.failNextSubmitTransport = true;
-    await s.acceptor.handle(s.req(paid(header)));
+    assert.equal(codeOf(await s.acceptor.handle(s.req(paid(header)))), E.SETTLEMENT_TIMEOUT);
     assert.equal(codeOf(await s.acceptor.handle(s.req(paid(header), { clientIp: '198.51.100.9' }))), E.IN_PROGRESS);
     assert.equal(codeOf(await s.acceptor.handle(s.req(paid(header), { clientIp: '198.51.100.10' }))), E.RATE_LIMITED);
   });

@@ -36,6 +36,8 @@ const key = (from: string, nonce: string): string => `${from.toLowerCase()}|${no
 export class FakeFiatToken implements ChainPort, Submitter {
   rpcCalls = 0;
   failRpc = false;
+  /** Only receipt reads fail (a flaky receipt endpoint behind a working one). */
+  failReceipts = false;
   failNextSimulation: string | undefined;
   /** true: fail before anything is sent; 'after-broadcast': the transaction is out, then the call fails. */
   failNextSubmitTransport: boolean | 'after-broadcast' = false;
@@ -185,6 +187,7 @@ export class FakeFiatToken implements ChainPort, Submitter {
 
   async getReceipt(txHash: Hex): Promise<TxReceipt | undefined> {
     this.rpc();
+    if (this.failReceipts) throw new Error('receipt unavailable');
     return this.receipts.get(txHash);
   }
 

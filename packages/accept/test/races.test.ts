@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { authorizationKey, singleUseKey } from 'agentpay-hub/protocol';
 import { AcceptErrorCode as E, MemorySellerLedger, type SellerPayment, accept } from '../src/index.js';
-import { CHAIN_ID, NOW_S, PRICE, USDC, codeOf, payHeader, setup, sha256, tick } from './helpers.js';
+import { CHAIN_ID, NOW_S, PAY_TO, PRICE, USDC, codeOf, payHeader, setup, sha256, tick } from './helpers.js';
 
 const paid = (h: string) => ({ 'payment-signature': h });
 const NONCE = `0x${'11'.repeat(32)}` as const;
@@ -74,7 +74,7 @@ describe('crash recovery', () => {
     const claimKey = singleUseKey({ sellerAccountId: 'seller-1', chainId: CHAIN_ID, asset: USDC, from: s.buyer.address, nonce: NONCE });
     await s.ledger.recordVerified({
       claimKey, sellerAccountId: 'seller-1', protocol: 'x402', chainId: CHAIN_ID, asset: USDC, payer: s.buyer.address,
-      nonce: NONCE, amount: PRICE.toString(), validBefore: String(NOW_S + 120), method: 'GET', path: '/rates', queryDigest: sha256(''),
+      nonce: NONCE, amount: PRICE.toString(), payTo: PAY_TO, validBefore: String(NOW_S + 120), method: 'GET', path: '/rates', queryDigest: sha256(''),
       headerDigest: sha256(header), meta: {},
     });
     await s.ledger.recordSettled(claimKey, `0x${'aa'.repeat(32)}`);
