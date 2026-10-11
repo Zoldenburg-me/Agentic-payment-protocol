@@ -1,4 +1,4 @@
-import type { Account, Chain, Hex, Log } from 'viem';
+import type { Chain, Hex, LocalAccount, Log } from 'viem';
 
 /**
  * The viem public-client methods the ports use, described structurally so a client for any chain
@@ -12,20 +12,24 @@ export interface ReadClient {
   getTransactionReceipt(args: { hash: Hex }): Promise<{
     transactionHash: Hex; status: 'success' | 'reverted'; blockNumber: bigint; logs: Log[];
   }>;
-  request(args: { method: 'eth_getLogs'; params: [{ address: Hex; topics: (Hex | null)[]; fromBlock: Hex; toBlock: Hex }] }): Promise<unknown>;
+  request(args: { method: 'eth_getLogs'; params: [{ address: Hex; topics: (Hex | null)[]; fromBlock: Hex; toBlock: 'latest' }] }): Promise<unknown>;
 }
 
 /** What the submitter needs to estimate; usually the same public client. */
 export interface EstimateClient {
-  estimateGas(args: { account: Account; to: Hex; data: Hex }): Promise<bigint>;
+  getChainId(): Promise<number>;
+  getTransactionCount(args: { address: Hex; blockTag: 'pending' }): Promise<number>;
+  estimateGas(args: { account: LocalAccount; to: Hex; data: Hex }): Promise<bigint>;
   estimateFeesPerGas(): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }>;
 }
 
-/** A viem wallet client with an account: pass `createWalletClient({ account, chain, transport })`. */
+/**
+ * A viem wallet client with a local account (`privateKeyToAccount`): pass
+ * `createWalletClient({ account, chain, transport })`. Transactions are signed here, so a hash is
+ * known before it is broadcast and a retry can resend the very same transaction.
+ */
 export interface SendClient {
-  readonly account?: Account;
+  readonly account?: { readonly type: string } | LocalAccount;
   readonly chain?: Chain;
-  sendTransaction(args: {
-    account: Account; chain: Chain | undefined; to: Hex; data: Hex; gas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint;
-  }): Promise<Hex>;
+  sendRawTransaction(args: { serializedTransaction: Hex }): Promise<Hex>;
 }
