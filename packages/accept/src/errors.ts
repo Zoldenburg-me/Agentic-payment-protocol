@@ -22,6 +22,8 @@ export const AcceptErrorCode = {
   SETTLEMENT_UNKNOWN: 'SETTLEMENT_UNKNOWN',
   /** Reported only (never a response code): the payment was accepted, then the seller's delivery threw. */
   DELIVERY_FAILED: 'DELIVERY_FAILED',
+  /** A hosted seller could not reach Zold, or Zold's answer was unusable: nothing was delivered, retry. */
+  UPSTREAM_UNAVAILABLE: 'UPSTREAM_UNAVAILABLE',
 } as const;
 
 export type AcceptErrorCode = (typeof AcceptErrorCode)[keyof typeof AcceptErrorCode];
@@ -46,7 +48,7 @@ const STATUS: Readonly<Partial<Record<AcceptErrorCode, number>>> = {
   [E.PRICE_ERROR]: 500, [E.CONFIG_INVALID]: 500, [E.LEDGER_TRANSITION]: 500, [E.INTERNAL]: 500, [E.DELIVERY_FAILED]: 500,
   [E.ASSET_DOMAIN_UNPINNED]: 500, [E.DOMAIN_MISMATCH]: 500,
   [E.SUBMIT_FAILED]: 502, [E.TRANSFER_MISMATCH]: 502,
-  [E.RPC_UNAVAILABLE]: 503, [E.SETTLEMENT_TIMEOUT]: 503, [E.STORE_FULL]: 503, [E.BUSY]: 503, [E.SETTLEMENT_UNKNOWN]: 503,
+  [E.RPC_UNAVAILABLE]: 503, [E.SETTLEMENT_TIMEOUT]: 503, [E.STORE_FULL]: 503, [E.BUSY]: 503, [E.SETTLEMENT_UNKNOWN]: 503, [E.UPSTREAM_UNAVAILABLE]: 503,
 };
 
 /** The HTTP status for a refusal. Anything not listed is a payment the seller did not accept: 402. */

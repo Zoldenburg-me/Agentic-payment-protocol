@@ -67,8 +67,13 @@ export interface AcceptDeps {
   readonly sleep?: (ms: number) => Promise<void>;
 }
 
+export interface HandleOptions {
+  /** Price this request with this instead of the configured price function (a host settling for many sellers). */
+  readonly price?: Price;
+}
+
 export interface Acceptor {
-  handle(req: ReqLike): Promise<AcceptResult>;
+  handle(req: ReqLike, options?: HandleOptions): Promise<AcceptResult>;
   /** Hands an error to `onError` (adapters use it for delivery failures). Never throws. */
   reportError(error: unknown): void;
   /**
@@ -156,10 +161,10 @@ export function ipBucket(ip: string): string {
 const isStringRecord = (v: unknown): v is Record<string, string> =>
   typeof v === 'object' && v !== null && !Array.isArray(v) && Object.values(v).every((x) => typeof x === 'string');
 
-function priceOf(config: AcceptConfig, req: ReqLike): Price | AcceptErrorCode {
+function priceOf(config: AcceptConfig, req: ReqLike, given: Price | undefined): Price | AcceptErrorCode {
   let p: Price;
   try {
-    p = config.price({ method: req.method, path: req.path, headers: req.headers });
+    p = given ?? config.price({ method: req.method, path: req.path, headers: req.headers });
   } catch {
     return E.PRICE_INVALID;
   }
@@ -622,9 +627,9 @@ async function verifyAndClaim(ctx: Ctx, req: ReqLike, price: Price, sig: Payment
 }
 
 /** Steps 1–3: canonical path, price (headers only), strict parsing, IP rate limit; then an earlier payment or a new one. */
-async function handlePayment(ctx: Ctx, req: ReqLike): Promise<AcceptResult> {
+async function handlePayment(ctx: Ctx, req: ReqLike, given: Price | undefined): Promise<AcceptResult> {
   if (!canonicalPath(req.path)) return respond(ctx, E.MALFORMED, req);
-  const price = priceOf(ctx.config, req);
+  const price = priceOf(ctx.config, req, given);
   if (typeof price === 'string') return respond(ctx, price, req);
   const header = req.headers['payment-signature'];
   if (header !== undefined && hasMppCredential(req)) return respond(ctx, E.BOTH_HEADERS, req);
@@ -648,6 +653,9 @@ async function handlePayment(ctx: Ctx, req: ReqLike): Promise<AcceptResult> {
   return verifyAndClaim(ctx, req, price, sig, digest);
 }
 
+/** What an adapter needs: answer requests, report delivery failures. Both an Acceptor and `zoldSeller` are one. */
+export type PaymentHandler = Pick<Acceptor, 'handle' | 'reportError'>;
+
 /** The framework-neutral core. Wrap `handle` with an adapter (e.g. `nodeHandler`). */
 export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
   const config = parseAcceptOptions(options);
@@ -661,9 +669,9 @@ export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
     env: { config, chain: deps.chain, submitter: deps.submitter, sleep },
   };
   return {
-    async handle(req) {
+    async handle(req, options) {
       try {
-        return await handlePayment(ctx, req);
+        return await handlePayment(ctx, req, options?.price);
       } catch (error) {
         report(ctx, error);
         return respond(ctx, E.INTERNAL, req);

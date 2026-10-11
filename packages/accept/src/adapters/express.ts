@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { Acceptor, PaidContext } from '../accept.js';
+import type { PaidContext, PaymentHandler } from '../accept.js';
 import { AcceptError, AcceptErrorCode as E } from '../errors.js';
 import { type NodeHandlerOptions, internalError, toReqLike } from './node-http.js';
 
@@ -23,7 +23,7 @@ export const paymentOf = (res: ExpressResponse): PaidContext | undefined => res.
  * change what a route costs. The client IP comes from `trustedProxyHops`, never from Express's
  * `trust proxy`, so both adapters see the same client.
  */
-export function expressPayment(acceptor: Acceptor, options: NodeHandlerOptions = {}) {
+export function expressPayment(acceptor: PaymentHandler, options: NodeHandlerOptions = {}) {
   return (req: ExpressRequest, res: ExpressResponse, next: Next): void => {
     Promise.resolve()
       .then(() => acceptor.handle(toReqLike(req, options, req.originalUrl ?? req.url ?? '/')))
@@ -48,7 +48,7 @@ export function expressPayment(acceptor: Acceptor, options: NodeHandlerOptions =
  * Express error middleware, registered after your routes: a paid request whose route failed is reported
  * as DELIVERY_FAILED and loses its receipt header; the error then goes on to your own error handling.
  */
-export function expressDeliveryErrors(acceptor: Acceptor) {
+export function expressDeliveryErrors(acceptor: PaymentHandler) {
   return (error: unknown, _req: ExpressRequest, res: ExpressResponse, next: Next): void => {
     const paid = paymentOf(res);
     if (paid !== undefined) {
