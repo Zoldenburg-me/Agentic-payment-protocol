@@ -16,7 +16,7 @@
     "pay": "tsx examples/pay-url.ts",
     "coverage": "c8 --check-coverage --lines 80 --branches 80 --functions 80 --include \"src/**\" --exclude \"src/mcp/server.ts\" --reporter text-summary --reporter text node --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\""
   },
-  "license": "MIT",
+  "license": "UNLICENSED",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
     "viem": "^2.57.3",
