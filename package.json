@@ -8,13 +8,13 @@
     "agentpay-mcp": "dist/mcp/server.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tsc -p packages/accept/tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\"",
+    "test": "node --conditions=agentpay-source --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\" \"packages/*/test/**/*.test.ts\"",
     "mcp": "tsx src/mcp/server.ts",
     "demo": "tsx examples/demo.ts",
     "pay": "tsx examples/pay-url.ts",
-    "coverage": "c8 --check-coverage --lines 80 --branches 80 --functions 80 --include \"src/**\" --exclude \"src/mcp/server.ts\" --reporter text-summary --reporter text node --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\""
+    "coverage": "c8 --check-coverage --lines 80 --branches 80 --functions 80 --include \"src/**\" --include \"packages/*/src/**\" --exclude \"src/mcp/server.ts\" --reporter text-summary --reporter text node --conditions=agentpay-source --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\" \"packages/*/test/**/*.test.ts\""
   },
   "license": "UNLICENSED",
   "dependencies": {
@@ -30,13 +30,18 @@
   },
   "exports": {
     ".": {
+      "agentpay-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
     "./protocol": {
+      "agentpay-source": "./src/protocol/index.ts",
       "types": "./dist/protocol/index.d.ts",
       "default": "./dist/protocol/index.js"
     },
     "./package.json": "./package.json"
-  }
+  },
+  "workspaces": [
+    "packages/*"
+  ]
 }
