@@ -1,47 +1,124 @@
-# agentpay-hub
+# Zold: accept AI agents as customers
 
-One interface for agent payment protocols. Point an agent at any paid URL; the hub works out
-which protocol the server speaks, checks your spend limits, pays, and returns the content.
+Buyer agents can already browse, compare and pay. Most businesses can't take their money. Zold is the
+seller side: a few lines in your server, and an agent that hits a paid route gets a price, pays, and
+gets the result, with no checkout page, no account and no human in the loop.
 
 ```
-agent ──► payment_fetch(url) ──► PaymentHub ──► 402? ─► adapters parse quotes (x402, MPP, …)
-                                                 │         │
-                                                 │   spend policy (per-tx cap, daily budget,
-                                                 │   host/protocol allowlist, known stablecoins)
-                                                 │         │
-                                                 └── cheapest payable quote ─► sign ─► retry ─► content + receipt
+agent ──► GET /report ──► your server + @zold/accept
+                              │
+                              ├─ no payment?  ─► 402 + price (x402 offer)
+                              │
+                              └─ payment?     ─► verify signature ─► claim once ─► settle on-chain
+                                                   ─► your route runs ─► 200 + receipt
 ```
 
 ## Status
 
-| Protocol | Layer | Status |
-|---|---|---|
-| **x402 v2** (Coinbase / x402 Foundation) | per-request HTTP 402, stablecoin | ✅ `exact` scheme on EVM (EIP-3009). **Verified once on Base Sepolia** (2026-10-08): one $0.01 test-USDC payment to Coinbase's demo endpoint settled on-chain. Not tested on mainnet, other servers, or other facilitators. |
-| **MPP** (Stripe + Tempo) | per-request HTTP 402, stablecoin/card/Lightning | ⚠️ `charge` intent parsed and credential built; **signer is a mock** (see below) |
-| ACP (OpenAI + Stripe) | merchant checkout | ❌ not an HTTP paywall; needs Stripe Shared Payment Tokens |
-| AP2 (Google) | signed-mandate authorization | ❌ needs a credentials provider |
-| UCP (Google + Shopify) | shopping journey | ❌ delegates payment to AP2 |
-| Visa TAP / Mastercard Agent Pay | card-network agent tokens | ❌ needs network enrolment |
+What works today, and what doesn't yet:
 
-The unsupported ones are different *layers* (checkout, authorization, card tokens), not paywalls,
-so they cannot be auto-detected from a 402 and need onboarding with the respective provider.
-`payment_status` lists them so an agent knows what is missing.
+| | Status |
+|---|---|
+| **x402 v2 acceptance** (`@zold/accept`) | ✅ Verify EIP-3009 authorizations, claim each payment once, settle `transferWithAuthorization` yourself (no facilitator), deliver once. USDC on Base and Base Sepolia. |
+| **Hosted settlement** (`zoldSeller`) | ✅ Price on your server; Zold verifies, settles to your own Safe, and keeps the ledger. You hold a `zsk_…` seller key, not a hot wallet. |
+| Server adapters | ✅ `node:http`, Express 4/5 |
+| **Live chain** | ⚠️ Seller side tested against an in-memory USDC and a scripted JSON-RPC, **not yet against a live chain**. |
+| MPP (Stripe + Tempo) | ❌ Seller side not started |
+| ACP (OpenAI + Stripe), UCP (Google + Shopify), AP2 (Google) | ❌ Planned: these are checkout and authorization flows, not per-request paywalls |
+| Visa TAP / Mastercard Agent Pay | ❌ Need network enrolment |
 
-Tested two ways. A local mock merchant (`src/testing/mock-merchant.ts`) verifies real EIP-712
-signatures for x402 and echoes MPP challenge ids. And one live x402 payment (1 cent of Base Sepolia
-test USDC, `https://x402.vercel.app/protected`) settled on-chain with a matching Transfer event.
-**Not yet tested on mainnet, with real funds, or against Tempo / MPP live.** Wire formats were taken from the x402 v2 spec and mpp.dev docs; MPP's
-receipt format is not documented, so receipt parsing is best-effort.
+Today this fits anything you can sell per HTTP request: APIs, data, reports, files, compute. Orders,
+bookings and leads need the checkout protocols in the last rows; that is the roadmap.
 
-## Use
+## Accept agent payments
 
-```bash
-npm install
-npm test          # 24 tests
-npm run demo      # runs the hub against the mock merchant
+### Hosted: no wallet to run
+
+```ts
+import express from 'express';
+import { zoldSeller, expressPayment, expressDeliveryErrors, paymentOf } from '@zold/accept';
+
+const seller = zoldSeller({
+  apiUrl: process.env.ZOLD_API_URL!,      // the Zold API origin
+  apiKey: process.env.ZOLD_SELLER_KEY!,   // zsk_…, keep it in env
+  price: () => ({ amount: 10_000n }),     // $0.01 in USDC atomic units (6 decimals)
+  onError: (e) => console.error(e),
+});
+
+const app = express();
+app.get('/report', expressPayment(seller), (req, res) => {
+  const paid = paymentOf(res)!;           // payer, amount, txHash, claimKey, …
+  res.json({ report: '…', paidBy: paid.payer });
+});
+app.use(expressDeliveryErrors(seller));
+app.listen(3000);
 ```
 
-### As an MCP server (works with any MCP-capable agent)
+If Zold can't be reached, nothing is delivered and the agent gets a 503 it can retry.
+
+### Self-hosted: you settle on your own RPC
+
+```ts
+import { createServer } from 'node:http';
+import { createPublicClient, createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { base } from 'viem/chains';
+import { MemorySingleUseStore } from 'agentpay-hub/protocol';
+import { accept, nodeHandler, viemChain, viemSubmitter, MemorySellerLedger } from '@zold/accept';
+
+const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const payTo = '0xYourTreasury…';
+const client = createPublicClient({ chain: base, transport: http(process.env.RPC_URL) });
+const wallet = createWalletClient({
+  chain: base, transport: http(process.env.RPC_URL),
+  account: privateKeyToAccount(process.env.GAS_KEY as `0x${string}`), // holds ETH for gas only
+});
+
+const acceptor = accept(
+  { sellerAccountId: 'my-shop', payTo, chainId: 8453, asset: USDC, price: () => ({ amount: 10_000n }) },
+  {
+    ledger: new MemorySellerLedger(),       // dev only: use a durable SellerLedgerPort in production
+    claims: new MemorySingleUseStore(),
+    chain: viemChain({ client, chainId: 8453 }),
+    submitter: viemSubmitter({ wallet, client, chainId: 8453, asset: USDC, payTo, maxGas: 150_000n, maxFeePerGas: 10_000_000_000n }),
+    onError: (e) => console.error(e),
+  },
+);
+
+createServer(nodeHandler(acceptor, (req, res, paid) => { res.end('the paid content'); })).listen(3000);
+setInterval(() => acceptor.reconcileOwed(), 60_000); // settle or expire payments left open
+```
+
+The gas key can only call `transferWithAuthorization` on the pinned token, to the pinned payee. Funds go
+straight from the agent to `payTo`; they never pass through the server.
+
+### How a payment is handled
+
+- **Price is header-only and deterministic.** `price` sees method, path and headers, never the body,
+  and must return the same price for the same request so a retry is delivered, not charged twice.
+- **Each payment is delivered once.** Payments are claimed by authorization nonce. A retry of a payment
+  that was already delivered comes back with `paid.replayed = true`: serve the same resource again,
+  keyed by `paid.claimKey`, and repeat no side effects.
+- **Settle, then deliver.** By default the route runs only after the transfer has 2 confirmations.
+  `optimistic` delivery (GET/HEAD only, up to $0.50) is opt-in.
+- **Built-in limits.** Per-IP and per-payer rate limits, a cap on settlements in flight (503 BUSY
+  beyond it), and a 4-minute maximum offer validity.
+- **Strict config.** Unknown options, out-of-range numbers and tokens without a pinned EIP-712 domain
+  are errors, never silent defaults.
+
+## The buyer side: `agentpay-hub`
+
+This repo also contains the agent-side client the seller package is built on. One interface for paying
+any agent paywall: point an agent at a URL, the hub works out which protocol the server speaks, checks
+spend limits, pays, and returns the content.
+
+| Protocol | Status |
+|---|---|
+| **x402 v2** | ✅ `exact` scheme on EVM (EIP-3009). One $0.01 test-USDC payment to Coinbase's demo endpoint settled on Base Sepolia (2026-10-08). Not tested on mainnet, other servers or other facilitators. |
+| **MPP** | ⚠️ `charge` intent parsed and credential built; the signer is a mock |
+| ACP, AP2, UCP, Visa TAP, Mastercard Agent Pay | ❌ Different layers (checkout, authorization, card tokens); can't be detected from a 402 |
+
+### As an MCP server (any MCP-capable agent)
 
 ```json
 {
@@ -61,50 +138,58 @@ npm run demo      # runs the hub against the mock merchant
 }
 ```
 
-Tools: `payment_quote` (price check, never pays), `payment_fetch` (fetch + auto-pay),
-`payment_status` (limits, spend, protocols).
-
-With no `AGENTPAY_EVM_PRIVATE_KEY` the server is **quote-only**: it can discover prices but cannot pay.
+Tools: `payment_quote` (price check, never pays), `payment_fetch` (fetch and pay),
+`payment_status` (limits, spend, supported protocols). Without `AGENTPAY_EVM_PRIVATE_KEY` the server is
+quote-only.
 
 ### As a library
 
 ```ts
 import { PaymentHub, evmX402Signer } from 'agentpay-hub';
 const hub = new PaymentHub({ wallet: { x402: evmX402Signer(key) } });
-const r = await hub.request('https://api.example.com/data');   // 'pay' mode
+const r = await hub.request('https://api.example.com/data');
 if (r.status === 'paid') console.log(await r.response.text(), r.receipt);
 ```
 
-## Safety model
+### Buyer safety model
 
-- Default caps: **$0.10 per call, $1.00 per day**. Only registered USD stablecoins are payable
-  (USDC on Base / Base Sepolia by default); anything else is refused. Extend via `withAssets`.
-- Budget is reserved *before* signing, and anything not explicitly released counts as spent.
-  The JSONL ledger makes the daily budget survive restarts.
-- Use a **dedicated hot wallet with a small balance**.
-- Over MCP, `payment_fetch` is **disabled until `AGENTPAY_ALLOWED_HOSTS` is set**, only `https://` URLs
-  are accepted, and hosts resolving to private/loopback/link-local addresses are refused.
-  `payment_quote` is GET-only so a price check has no side effects.
-- Redirects are never followed (payment is bound to the exact URL), requests time out after 15 s, and
-  response bodies are read with a hard cap.
-- x402 signatures are valid for at most 5 minutes regardless of what the server asks for, and malformed
-  offers are dropped. A 402 reply *after* signing keeps the amount counted until the day rolls over,
-  because the server holds a signed authorization it could still settle.
-- One process per ledger file: the budget is not shared across processes.
-- Known limit: the private-address check resolves DNS before fetching, so DNS rebinding is only
-  fully covered by the host allowlist.
+- Default caps: **$0.10 per call, $1.00 per day**. Only registered USD stablecoins are payable (USDC on
+  Base / Base Sepolia by default). Extend via `withAssets`.
+- Budget is reserved before signing; anything not explicitly released counts as spent. The JSONL ledger
+  keeps the daily budget across restarts. One process per ledger file.
+- Over MCP, `payment_fetch` is disabled until `AGENTPAY_ALLOWED_HOSTS` is set; only `https://` URLs are
+  accepted, and hosts resolving to private, loopback or link-local addresses are refused. DNS rebinding
+  is only fully covered by the host allowlist.
+- Redirects are never followed, requests time out after 15 s, and response bodies are size-capped.
+- x402 signatures are valid for at most 5 minutes. A 402 after signing keeps the amount counted until
+  the day rolls over, since the server holds an authorization it could still settle.
+- Use a dedicated hot wallet with a small balance.
 
-## Adding a protocol
+To add a protocol, implement `ProtocolAdapter` (`src/types.ts`) and add it to `DEFAULT_ADAPTERS`.
 
-Implement `ProtocolAdapter` (`src/types.ts`): `parseQuotes`, `canPay`, `authorize`, `parseReceipt`,
-add it to `DEFAULT_ADAPTERS`, and add a signer capability to `Wallet`.
+## Develop
 
-## To do for real use
+```bash
+npm install
+npm test          # 509 tests, buyer and seller
+npm run demo      # the hub paying a local mock merchant
+npm run build
+```
 
-1. A real MPP signer (submit the Tempo transfer / Stripe SPT and return the proof).
-2. Test x402 against a live facilitator on Base Sepolia.
-3. x402 v1 (`X-PAYMENT` header, body-encoded requirements) for older servers.
-4. ACP / AP2 adapters once you have provider credentials to test against.
+| Path | What it is |
+|---|---|
+| `packages/accept/` | `@zold/accept`, the seller side |
+| `src/protocol/` | Shared wire formats: x402 and MPP codecs, EIP-3009 verification, single-use claims |
+| `src/` | `agentpay-hub`, the buyer side, and its MCP server |
+| `docs/CODEMAPS/` | Architecture and dependency maps |
+
+## Roadmap
+
+1. Run seller settlement on Base Sepolia, then mainnet.
+2. A durable `SellerLedgerPort` (Postgres) for production self-hosting.
+3. ACP and UCP checkout on the seller side, backed by the merchant's existing Stripe account, so
+   agents can place orders and bookings, not just pay per request.
+4. MPP acceptance; a real MPP signer on the buyer side.
 
 ---
 
