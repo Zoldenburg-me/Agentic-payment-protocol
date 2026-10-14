@@ -18,9 +18,10 @@ export interface ReadClient {
 /** What the submitter needs to estimate; usually the same public client. */
 export interface EstimateClient {
   getChainId(): Promise<number>;
-  getTransactionCount(args: { address: Hex; blockTag: 'pending' }): Promise<number>;
+  getTransactionCount(args: { address: Hex; blockTag: 'pending' | 'latest' }): Promise<number>;
   estimateGas(args: { account: LocalAccount; to: Hex; data: Hex }): Promise<bigint>;
   estimateFeesPerGas(): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }>;
+  request(args: { method: 'eth_getTransactionByHash'; params: [Hex] }): Promise<unknown>;
 }
 
 /**

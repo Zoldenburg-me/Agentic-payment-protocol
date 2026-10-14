@@ -86,6 +86,38 @@ describe('PaymentHub against a mock merchant', () => {
     assert.equal(merchant.settled.length, 2);
   });
 
+  it('holds the daily budget when payments run concurrently', async () => {
+    // Every 402 body's cancel() waits until all requests reach it, so each policy check
+    // runs before any reservation: the widest interleaving a real event loop can produce.
+    const parallel = 6;
+    let arrived = 0;
+    let openGate = (): void => undefined;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    const fallback = setTimeout(openGate, 2_000);
+    const gatedFetch: typeof fetch = async (input, init) => {
+      const res = await fetch(input, init);
+      if (res.status !== 402) return res;
+      const body = new ReadableStream({
+        async cancel() {
+          if (++arrived === parallel) openGate();
+          await gate;
+        },
+      });
+      return new Response(body, { status: 402, headers: res.headers });
+    };
+    const h = new PaymentHub({
+      wallet: fullWallet(), policy: { dailyBudgetUsdMicros: 20_000n }, assets, fetch: gatedFetch,
+    });
+    const results = await Promise.all(
+      Array.from({ length: parallel }, () => h.request(`${merchant.url}/x402/weather`)),
+    );
+    clearTimeout(fallback);
+    assert.equal(results.filter((r) => r.status === 'paid').length, 2);
+    assert.equal(results.filter((r) => r.status === 'blocked').length, 4);
+    assert.equal(merchant.settled.length, 2);
+    assert.equal(h.ledger.spentToday(), 20_000n);
+  });
+
   it('enforces the host allowlist', async () => {
     const result = await hub(fullWallet(), { allowedHosts: ['api.example.com'] })
       .request(`${merchant.url}/x402/weather`);

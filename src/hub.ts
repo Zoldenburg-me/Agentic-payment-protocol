@@ -124,13 +124,19 @@ export class PaymentHub {
     const choice = this.choose(reports);
     if (!choice || !choice.verdict.ok) return discardBody(first, { status: 'blocked', quotes: reports });
     await discardBody(first, undefined);
-    return this.pay(url, init, choice.quote, choice.verdict.usdMicros, reports);
+    return this.pay(url, init, choice.quote, reports);
   }
 
   private async pay(
-    url: string, init: HubRequest, quote: Quote, usdMicros: bigint, reports: readonly QuoteReport[],
+    url: string, init: HubRequest, quote: Quote, reports: readonly QuoteReport[],
   ): Promise<HubResult> {
-    // Reserve synchronously with the policy check so concurrent calls cannot overspend.
+    // The caller awaited after its policy check, so re-check against the current ledger and
+    // reserve in the same synchronous step: concurrent calls cannot both pass and overspend.
+    const verdict = evaluate(quote, this.policy, this.assets, this.ledger.spentToday());
+    if (!verdict.ok) {
+      return { status: 'blocked', quotes: reports.map((r) => (r.quote === quote ? { ...r, verdict } : r)) };
+    }
+    const { usdMicros } = verdict; // the price just checked, never one computed before the await
     const entryId = this.ledger.reserve(url, quote.protocol, usdMicros);
     const adapter = this.adapterFor(quote);
 

@@ -402,3 +402,313 @@ describe('viemChain: reading the newest block', () => {
     assert.equal((rpc.of('eth_getLogs')[0]?.params[0] as { toBlock: string }).toBlock, 'latest');
   });
 });
+
+describe('viemSubmitter.replaceStuck: re-pricing a transaction that waits too long', () => {
+  const account = privateKeyToAccount(generatePrivateKey());
+  /** A node that accepts every broadcast but mines only what the test says. Base fee 10 gwei-ish units; tip 1e6. */
+  const node = () => {
+    const rpc = new ScriptedRpc().on('eth_estimateGas', () => numberToHex(80_000n));
+    const state = { mined: 0, pending: 0, known: new Set<Hex>() };
+    rpc.on('eth_getTransactionCount', (p) => numberToHex(p[1] === 'latest' ? state.mined : state.pending));
+    rpc.on('eth_getTransactionByHash', (p) => (state.known.has(p[0] as Hex) ? { hash: p[0] } : null));
+    rpc.on('eth_sendRawTransaction', (p) => {
+      state.pending = Math.max(state.pending, (parseTransaction(p[0] as Hex).nonce ?? 0) + 1);
+      state.known.add(keccak256(p[0] as Hex));
+      return keccak256(p[0] as Hex);
+    });
+    return { rpc, state };
+  };
+  const setupBump = (over: Record<string, unknown> = {}) => {
+    const { rpc, state } = node();
+    let t = 1_000_000;
+    const s = viemSubmitter({
+      wallet: rpc.walletClient(account), client: rpc.publicClient(), chainId: CHAIN, asset: USDC, payTo: PAY_TO,
+      maxGas: 150_000n, maxFeePerGas: 100_000_000n, timeoutMs: 200, replaceAfterMs: 60_000, now: () => t, ...over,
+    } as never);
+    return { rpc, state, s, advance: (ms: number) => { t += ms; } };
+  };
+  const txs = (rpc: ScriptedRpc) => rpc.of('eth_sendRawTransaction').map((c) => parseTransaction(c.params[0] as Hex));
+  /** The network now asks more than the transaction offers: base fee 10 000 000 -> `base`. */
+  const feesRise = (rpc: ScriptedRpc, base = 11_000_000n) => rpc.on('eth_getBlockByNumber', () => block(1_000n, base));
+  const withValidBefore = (n: number, validBefore: bigint): TransferCall => {
+    const c = nthCall(n);
+    return { ...c, authorization: { ...c.authorization, validBefore } };
+  };
+
+  it('leaves a transaction alone until it has waited replaceAfterMs', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(call());
+    feesRise(rpc);
+    advance(59_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 0, unreplaced: 0 });
+    assert.equal(txs(rpc).length, 1);
+  });
+
+  it('a transaction still priced at market is rebroadcast as it is, never bumped', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(call());
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 0, unreplaced: 0 });
+    const [first, second] = rpc.of('eth_sendRawTransaction').map((c) => c.params[0]);
+    assert.equal(second, first);
+  });
+
+  it('re-signs the same nonce, data and gas at least 12.5% dearer, and a retry sends the replacement', async () => {
+    const { rpc, s, advance } = setupBump();
+    const first = await s.submit(call());
+    feesRise(rpc);
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 1, unreplaced: 0 });
+    const [old, bumped] = txs(rpc);
+    assert.equal(bumped?.nonce, old?.nonce);
+    assert.equal(bumped?.data, old?.data);
+    assert.equal(bumped?.gas, old?.gas);
+    assert.equal(bumped?.to, old?.to);
+    assert.ok((bumped?.maxFeePerGas ?? 0n) * 8n >= (old?.maxFeePerGas ?? 0n) * 9n);
+    assert.ok((bumped?.maxPriorityFeePerGas ?? 0n) * 8n >= (old?.maxPriorityFeePerGas ?? 0n) * 9n);
+    const again = await s.submit(call());
+    assert.notEqual(again, first);
+    assert.equal(again, keccak256(rpc.of('eth_sendRawTransaction')[1]?.params[0] as Hex));
+    assert.equal(rpc.of('eth_sendRawTransaction')[2]?.params[0], rpc.of('eth_sendRawTransaction')[1]?.params[0]);
+  });
+
+  it('takes the current fee when the network asks more than the 12.5% bump', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(call());
+    feesRise(rpc, 50_000_000n);
+    advance(60_000);
+    await s.replaceStuck?.();
+    const [old, bumped] = txs(rpc);
+    assert.ok((bumped?.maxFeePerGas ?? 0n) > ((old?.maxFeePerGas ?? 0n) * 9n) / 8n + 1n);
+  });
+
+  it('a zero tip is still raised, so a node takes the replacement', async () => {
+    const { rpc, s, advance } = setupBump();
+    rpc.on('eth_maxPriorityFeePerGas', () => '0x0');
+    await s.submit(call());
+    feesRise(rpc);
+    advance(60_000);
+    await s.replaceStuck?.();
+    const [old, bumped] = txs(rpc);
+    assert.equal(old?.maxPriorityFeePerGas ?? 0n, 0n, 'viem leaves a zero field undefined');
+    assert.ok((bumped?.maxPriorityFeePerGas ?? 0n) > 0n);
+  });
+
+  it('at the cap: clamps to maxFeePerGas while that is still a 10% bump', async () => {
+    const { rpc, s, advance } = setupBump({ maxFeePerGas: 15_000_000n });
+    await s.submit(call());
+    feesRise(rpc, 30_000_000n);
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 1, unreplaced: 0 });
+    assert.equal(txs(rpc)[1]?.maxFeePerGas, 15_000_000n);
+  });
+
+  it('never re-prices above maxFeePerGas: below a 10% bump it is left as it is and counted', async () => {
+    const { rpc, s, advance } = setupBump({ maxFeePerGas: 14_000_000n });
+    await s.submit(call());
+    feesRise(rpc, 30_000_000n);
+    advance(60_000);
+    const out = await s.replaceStuck?.();
+    assert.equal(out?.replaced, 0);
+    assert.equal(out?.unreplaced, 1);
+    assert.equal(txs(rpc).length, 1);
+  });
+
+  it('a replacement the node refuses is counted with its cause, and the next pass tries again', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(call());
+    feesRise(rpc);
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('replacement transaction underpriced'); });
+    advance(60_000);
+    const out = await s.replaceStuck?.();
+    assert.equal(out?.unreplaced, 1);
+    assert.match(String((out?.cause as Error | undefined)?.message), /underpriced/);
+    rpc.on('eth_sendRawTransaction', (p) => keccak256(p[0] as Hex));
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 1, unreplaced: 0 });
+  });
+
+  it('"already known" means the node has the replacement: it counts as replaced', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(call());
+    feesRise(rpc);
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('already known'); });
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 1, unreplaced: 0 });
+  });
+
+  it('"nonce too low" means the nonce is spent: the entry is forgotten and a retry signs afresh', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(call());
+    feesRise(rpc);
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('nonce too low'); });
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 0, unreplaced: 0 });
+    rpc.on('eth_sendRawTransaction', (p) => keccak256(p[0] as Hex));
+    await s.submit(call());
+    assert.equal(rpc.of('eth_estimateGas').length, 2);
+  });
+
+  it('forgets a transaction whose nonce is mined, so a retry signs afresh instead of resending it', async () => {
+    const { rpc, state, s, advance } = setupBump();
+    await s.submit(call());
+    state.mined = 1;
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 0, unreplaced: 0 });
+    assert.equal(txs(rpc).length, 1);
+    await s.submit(call());
+    assert.equal(rpc.of('eth_estimateGas').length, 2);
+  });
+
+  it('never sends a transaction whose own broadcast failed, even after another payment took its nonce', async () => {
+    const { rpc, state, s, advance } = setupBump();
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('fetch failed'); });
+    await assert.rejects(s.submit(nthCall(1)));
+    const failed = rpc.of('eth_sendRawTransaction')[0]?.params[0] as Hex;
+    rpc.on('eth_sendRawTransaction', (p) => {
+      state.pending = Math.max(state.pending, (parseTransaction(p[0] as Hex).nonce ?? 0) + 1);
+      return keccak256(p[0] as Hex);
+    });
+    await s.submit(nthCall(2));
+    feesRise(rpc);
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 1, unreplaced: 0 });
+    const dataOf = (raw: Hex) => parseTransaction(raw).data;
+    const sentFailed = rpc.of('eth_sendRawTransaction').filter((c) => dataOf(c.params[0] as Hex) === dataOf(failed));
+    assert.equal(sentFailed.length, 1, 'only its own failed attempt');
+    await s.submit(nthCall(1));
+    assert.equal(txs(rpc).at(-1)?.nonce, 1, 'its nonce went to another payment: signed afresh on the next one');
+  });
+
+  it('a broadcast the node took despite a transport error is never signed a second time', async () => {
+    const { rpc, state, s } = setupBump();
+    rpc.on('eth_sendRawTransaction', (p) => {
+      state.pending = Math.max(state.pending, (parseTransaction(p[0] as Hex).nonce ?? 0) + 1);
+      state.known.add(keccak256(p[0] as Hex));
+      throw rpcError('fetch failed');
+    });
+    await assert.rejects(s.submit(nthCall(1)));
+    const first = rpc.of('eth_sendRawTransaction')[0]?.params[0] as Hex;
+    rpc.on('eth_sendRawTransaction', (p) => {
+      state.pending = Math.max(state.pending, (parseTransaction(p[0] as Hex).nonce ?? 0) + 1);
+      state.known.add(keccak256(p[0] as Hex));
+      return keccak256(p[0] as Hex);
+    });
+    await s.submit(nthCall(2)); // takes the next nonce, past the first
+    assert.equal(await s.submit(nthCall(1)), keccak256(first));
+    assert.equal(rpc.of('eth_estimateGas').length, 2, 'payment 1 was not signed again');
+  });
+
+  it('a retried broadcast waits a full replaceAfterMs from its acceptance before any bump', async () => {
+    const { rpc, s, advance } = setupBump();
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('fetch failed'); });
+    await assert.rejects(s.submit(call()));
+    advance(60_000);
+    rpc.on('eth_sendRawTransaction', (p) => keccak256(p[0] as Hex));
+    await s.submit(call()); // accepted only now
+    feesRise(rpc);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 0, unreplaced: 0 });
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 1, unreplaced: 0 });
+  });
+
+  it('never sends a transaction whose own broadcast failed, even when nothing else took its nonce', async () => {
+    const { rpc, s, advance } = setupBump();
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('fetch failed'); });
+    await assert.rejects(s.submit(call()));
+    rpc.on('eth_sendRawTransaction', (p) => keccak256(p[0] as Hex));
+    feesRise(rpc);
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 0, unreplaced: 0 });
+    assert.equal(txs(rpc).length, 1, 'only its own failed attempt');
+  });
+
+  it('a submit the node answers "already known" for has gone out: it returns the hash', async () => {
+    const { rpc, s } = setupBump();
+    rpc.on('eth_sendRawTransaction', () => { throw rpcError('already known'); });
+    assert.equal(await s.submit(call()), keccak256(rpc.of('eth_sendRawTransaction')[0]?.params[0] as Hex));
+  });
+
+  it('an expired authorization is re-priced only when a later transaction waits behind its nonce', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(withValidBefore(1, 1_500n));
+    feesRise(rpc);
+    advance(600_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 0, unreplaced: 0 });
+    assert.equal(txs(rpc).length, 1, 'nothing waits behind it: not bumped');
+    await s.submit(nthCall(2)); // signed at today's fees: it is at market, so only rebroadcast
+    advance(60_000);
+    assert.deepEqual(await s.replaceStuck?.(), { replaced: 1, unreplaced: 0 });
+    const atNonce0 = txs(rpc).filter((t) => (t.nonce ?? 0) === 0);
+    assert.equal(atNonce0.length, 2, 'the expired one was re-priced, since nonce 1 waits behind it');
+    assert.ok((atNonce0[1]?.maxFeePerGas ?? 0n) > (atNonce0[0]?.maxFeePerGas ?? 0n));
+  });
+
+  it('one pass reads fees once, and a failure on one transaction does not stop the others', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(nthCall(1));
+    await s.submit(nthCall(2));
+    feesRise(rpc);
+    advance(60_000);
+    let broadcasts = 0;
+    rpc.on('eth_sendRawTransaction', (p) => {
+      broadcasts += 1;
+      if (broadcasts === 1) throw rpcError('fetch failed');
+      return keccak256(p[0] as Hex);
+    });
+    const tips = rpc.of('eth_maxPriorityFeePerGas').length;
+    const out = await s.replaceStuck?.();
+    assert.equal(out?.replaced, 1);
+    assert.equal(out?.unreplaced, 1);
+    assert.equal(rpc.of('eth_maxPriorityFeePerGas').length, tips + 1);
+  });
+
+  it('a pass stops at its time budget; the rest wait for the next pass', async () => {
+    const { rpc, s, advance } = setupBump({ timeoutMs: 1_000 });
+    await s.submit(nthCall(1));
+    await s.submit(nthCall(2));
+    feesRise(rpc);
+    advance(60_000);
+    rpc.on('eth_sendRawTransaction', (p) => { advance(1_001); return keccak256(p[0] as Hex); });
+    const out = await s.replaceStuck?.();
+    assert.equal(out?.replaced, 1);
+    assert.equal(out?.unreplaced, 1);
+  });
+
+  it('concurrent calls share one pass', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(call());
+    advance(60_000);
+    await Promise.all([s.replaceStuck?.(), s.replaceStuck?.()]);
+    assert.equal(rpc.of('eth_getTransactionCount').filter((c) => c.params[1] === 'latest').length, 1);
+  });
+
+  it('runs in the submit queue: never at the same time as a send', async () => {
+    const { rpc, s, advance } = setupBump();
+    await s.submit(nthCall(1));
+    feesRise(rpc);
+    advance(60_000);
+    let overlapping = false;
+    let sending = 0;
+    rpc.on('eth_sendRawTransaction', async (p) => {
+      sending += 1;
+      if (sending > 1) overlapping = true;
+      await new Promise((r) => setTimeout(r, 20));
+      sending -= 1;
+      return keccak256(p[0] as Hex);
+    });
+    await Promise.all([s.replaceStuck?.(), s.submit(nthCall(2))]);
+    assert.equal(overlapping, false);
+  });
+
+  it('options are parsed strictly: replaceAfterMs and now', () => {
+    const bad = (over: Record<string, unknown>) => assert.throws(() => setupBump(over), isConfig);
+    bad({ replaceAfterMs: 0 });
+    bad({ replaceAfterMs: 1.5 });
+    bad({ now: 'soon' });
+  });
+});
+
+function nthCall(n: number): TransferCall {
+  const c = call();
+  return { ...c, authorization: { ...c.authorization, nonce: pad(numberToHex(n), { size: 32 }) } };
+}

@@ -78,8 +78,10 @@ export interface Acceptor {
   reportError(error: unknown): void;
   /**
    * Settles, expires or reports open payments without a request: those whose request timed out, or
-   * whose payer never came back. Run it on a timer (e.g. every minute) in one process. Rows still
-   * valid but never sent stay open, since the ledger holds no signature; they expire later.
+   * whose payer never came back. Run it on a timer (e.g. every minute) in one process. It first asks
+   * the submitter to re-price stuck transactions. Rows still valid but never sent stay open, since the
+   * ledger holds no signature; they expire later. Last, it prunes expired claims from `claims`, which
+   * otherwise fills and refuses every payment.
    */
   reconcileOwed(): Promise<ReconcileReport>;
   /** Resolves once optimistic background settlements have finished. */
@@ -427,26 +429,60 @@ async function reconcileRow(ctx: Ctx, row: SellerPayment): Promise<'settled' | '
   }
 }
 
-/** Settles, expires or reports every open row without waiting for its payer to retry. */
-async function reconcileOwed(ctx: Ctx): Promise<ReconcileReport> {
-  const counts = { checked: 0, settled: 0, refused: 0, open: 0 };
-  for (const listed of await ctx.deps.ledger.list()) {
-    if (!isOpen(listed)) continue;
-    const row = await ctx.deps.ledger.get(listed.claimKey); // re-read: another process may have moved it
-    if (!row || !isOpen(row)) continue;
-    counts.checked += 1;
-    if (ctx.active.has(row.claimKey)) {
-      counts.open += 1; // a request here is settling it right now
-      continue;
+/** A stuck transaction holds back every later one from the same key: re-price those first. */
+async function replaceStuck(ctx: Ctx): Promise<void> {
+  const { submitter } = ctx.env;
+  if (submitter.replaceStuck === undefined) return;
+  try {
+    const { unreplaced, cause } = await submitter.replaceStuck();
+    if (unreplaced > 0) {
+      const message = `${unreplaced} stuck transaction(s) could not be re-priced (fee cap, relay balance or RPC; see cause)`;
+      report(ctx, new AcceptError(E.SUBMIT_FAILED, message, cause === undefined ? undefined : { cause }));
     }
-    ctx.active.add(row.claimKey);
-    try {
-      counts[await reconcileRow(ctx, row)] += 1;
-    } finally {
-      ctx.active.delete(row.claimKey);
-    }
+  } catch (error) {
+    // The raw message may hold the RPC URL (and its key): it travels only as the cause.
+    report(ctx, new AcceptError(E.SUBMIT_FAILED, 'replaceStuck failed', { cause: error }));
   }
-  return counts;
+}
+
+/** Re-prices stuck transactions, then settles, expires or reports every open row without waiting for its payer to retry. */
+async function reconcileOwed(ctx: Ctx): Promise<ReconcileReport> {
+  try {
+    await replaceStuck(ctx);
+    const counts = { checked: 0, settled: 0, refused: 0, open: 0 };
+    for (const listed of await ctx.deps.ledger.list()) {
+      if (!isOpen(listed)) continue;
+      const row = await ctx.deps.ledger.get(listed.claimKey); // re-read: another process may have moved it
+      if (!row || !isOpen(row)) continue;
+      counts.checked += 1;
+      if (ctx.active.has(row.claimKey)) {
+        counts.open += 1; // a request here is settling it right now
+        continue;
+      }
+      ctx.active.add(row.claimKey);
+      try {
+        counts[await reconcileRow(ctx, row)] += 1;
+      } finally {
+        ctx.active.delete(row.claimKey);
+      }
+    }
+    return counts;
+  } finally {
+    await pruneClaims(ctx); // even when a ledger or chain outage stopped the rows: a full store refuses everyone
+  }
+}
+
+/**
+ * A claim expires only after its authorization's validBefore plus a margin, when no replay can
+ * verify any more, so pruning frees space without reopening a nonce. Without it the store fills
+ * and then refuses every payment. A failure is reported; the reconcile counts still stand.
+ */
+async function pruneClaims(ctx: Ctx): Promise<void> {
+  try {
+    await ctx.deps.claims.prune(Math.floor(ctx.deps.now() / 1000));
+  } catch (error) {
+    report(ctx, error);
+  }
 }
 
 /**

@@ -5,7 +5,7 @@ export type { AcceptConfig, AcceptOptions, Price, PriceFn, PriceRequest } from '
 export { AcceptError, AcceptErrorCode, statusFor } from './errors.js';
 export { ChainRevertError } from './ports.js';
 export type {
-  ChainLog, ChainPort, NewSellerPayment, RateLimiter, SellerLedgerPort, SellerPayment, SellerPaymentStatus, Submitter,
+  ChainLog, ChainPort, NewSellerPayment, RateLimiter, SellerLedgerPort, SellerPayment, SellerPaymentStatus, StuckReport, Submitter,
   TransferCall, TxReceipt,
 } from './ports.js';
 export { nodeHandler, toReqLike } from './adapters/node-http.js';

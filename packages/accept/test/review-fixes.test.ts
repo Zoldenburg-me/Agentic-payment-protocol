@@ -47,7 +47,7 @@ describe('replay is bound to what was bought', () => {
     const header = await payHeader(s.buyer);
     assert.equal((await s.acceptor.handle(s.req(paid(header), { query: 'email=ada%40example.org' }))).kind, 'paid');
     const [row] = await s.ledger.list();
-    assert.doesNotMatch(JSON.stringify(row), /ada|example\.org/);
+    assert.doesNotMatch(JSON.stringify(row), /ada%40|example\.org/); // not bare 'ada': random hex can hold it
     assert.equal((await s.acceptor.handle(s.req(paid(header), { query: 'email=ada%40example.org' }))).kind, 'paid');
   });
 

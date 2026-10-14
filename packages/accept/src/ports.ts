@@ -55,6 +55,18 @@ export interface ChainPort extends Eip3009Rpc {
  */
 export interface Submitter {
   submit(call: TransferCall): Promise<Hex>;
+  /**
+   * Optional: re-prices transactions a node accepted that have waited too long to be mined, keeping
+   * their nonce (so at most one version can land). `unreplaced` counts those it could not re-price,
+   * with the last `cause`.
+   */
+  replaceStuck?(): Promise<StuckReport>;
+}
+
+export interface StuckReport {
+  readonly replaced: number;
+  readonly unreplaced: number;
+  readonly cause?: unknown;
 }
 
 export interface RateLimiter {

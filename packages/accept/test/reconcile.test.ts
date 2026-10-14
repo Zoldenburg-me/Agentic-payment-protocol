@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { AcceptError, AcceptErrorCode as E, EXPIRY_GRACE_S, MemorySellerLedger, type SellerPayment } from '../src/index.js';
-import { codeOf, payHeader, setup } from './helpers.js';
+import { CLAIM_MARGIN_S } from 'agentpay-hub/protocol';
+import { codeOf, payHeader, setup, tick } from './helpers.js';
 
 const paid = (h: string) => ({ 'payment-signature': h });
 const PAST_GRACE_MS = (120 + EXPIRY_GRACE_S + 1) * 1000;
@@ -81,6 +82,7 @@ describe('reconcileOwed', () => {
     const s = setup({}, { autoMine: false });
     const pending = s.acceptor.handle(s.req(paid(await payHeader(s.buyer))));
     await s.chain.untilSubmitted(1);
+    await tick(); // let the request reach its polling loop, so only reconcile's own reads could land in between
     const calls = s.chain.rpcCalls;
     assert.deepEqual(await s.acceptor.reconcileOwed(), { checked: 1, settled: 0, refused: 0, open: 1 });
     assert.equal(s.chain.rpcCalls, calls, 'no chain reads for it');
@@ -121,5 +123,74 @@ describe('reconcileOwed', () => {
     ledger.gets = 0;
     assert.deepEqual(await s.acceptor.reconcileOwed(), { checked: 0, settled: 0, refused: 0, open: 0 });
     assert.equal(ledger.gets, 0);
+  });
+});
+
+describe('reconcileOwed re-prices stuck transactions first', () => {
+  it('asks the submitter to replace stuck transactions, and reports any it could not', async () => {
+    let asked = 0;
+    const s = setup({}, {}, {});
+    const withBump = setup({}, {}, {
+      submitter: {
+        submit: (c) => s.chain.submit(c),
+        replaceStuck: async () => { asked += 1; return { replaced: 1, unreplaced: 2, cause: new Error('underpriced') }; },
+      },
+    });
+    await withBump.acceptor.reconcileOwed();
+    assert.equal(asked, 1);
+    assert.deepEqual(codesOf(withBump.errors), [E.SUBMIT_FAILED]);
+    assert.match((withBump.errors[0] as Error).message, /2 stuck/);
+    assert.match(String(((withBump.errors[0] as Error).cause as Error).message), /underpriced/);
+  });
+
+  it('a failing replaceStuck is reported without its raw message (it may hold an RPC URL), and rows are still reconciled', async () => {
+    const s = setup({ settlementTimeoutMs: 5 }, { autoMine: false });
+    const cause = new Error('fetch failed: https://rpc.example/v2/SECRETKEY');
+    const r = setup({ settlementTimeoutMs: 5 }, { autoMine: false }, {
+      submitter: { submit: (c) => s.chain.submit(c), replaceStuck: () => Promise.reject(cause) },
+    });
+    assert.deepEqual(await r.acceptor.reconcileOwed(), { checked: 0, settled: 0, refused: 0, open: 0 });
+    assert.deepEqual(codesOf(r.errors), [E.SUBMIT_FAILED]);
+    assert.doesNotMatch((r.errors[0] as Error).message, /SECRETKEY/);
+    assert.equal((r.errors[0] as Error).cause, cause);
+  });
+
+  it('prunes expired payment claims, so a long-running seller never fills the store', async () => {
+    const s = setup();
+    assert.equal((await s.acceptor.handle(s.req(paid(await payHeader(s.buyer))))).kind, 'paid');
+    s.advance((120 + CLAIM_MARGIN_S + 1) * 1000);
+    await s.acceptor.reconcileOwed();
+    assert.equal(await s.claims.prune(Number.MAX_SAFE_INTEGER), 0);
+  });
+
+  it('prunes expired claims even when reconciliation itself fails', async () => {
+    const s = setup();
+    assert.equal((await s.acceptor.handle(s.req(paid(await payHeader(s.buyer))))).kind, 'paid');
+    const outage = new Error('ledger offline');
+    const r = setup({}, {}, { claims: s.claims, ledger: Object.assign(Object.create(s.ledger), { list: () => Promise.reject(outage) }) });
+    r.advance((120 + CLAIM_MARGIN_S + 1) * 1000);
+    await assert.rejects(r.acceptor.reconcileOwed(), outage);
+    assert.equal(await s.claims.prune(Number.MAX_SAFE_INTEGER), 0);
+  });
+
+  it('keeps claims whose authorization could still be replayed', async () => {
+    const s = setup();
+    assert.equal((await s.acceptor.handle(s.req(paid(await payHeader(s.buyer))))).kind, 'paid');
+    await s.acceptor.reconcileOwed();
+    assert.ok((await s.claims.prune(Number.MAX_SAFE_INTEGER)) > 0);
+  });
+
+  it('reports a failing prune and still returns the reconcile counts', async () => {
+    const s = setup();
+    const cause = new Error('store offline');
+    const r = setup({}, {}, { claims: { claim: (k, e) => s.claims.claim(k, e), release: (k, t) => s.claims.release(k, t), prune: () => Promise.reject(cause) } });
+    assert.deepEqual(await r.acceptor.reconcileOwed(), { checked: 0, settled: 0, refused: 0, open: 0 });
+    assert.deepEqual(r.errors, [cause]);
+  });
+
+  it('nothing is reported when every stuck transaction was replaced', async () => {
+    const r = setup({}, {}, { submitter: { submit: () => Promise.reject(new Error('unused')), replaceStuck: async () => ({ replaced: 3, unreplaced: 0 }) } });
+    await r.acceptor.reconcileOwed();
+    assert.equal(r.errors.length, 0);
   });
 });
