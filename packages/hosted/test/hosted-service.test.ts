@@ -15,7 +15,7 @@ import { type HostedLimits, MAX_BODY_BYTES, SETTLE_ROUTE, hostedService } from '
 
 const PAY_A = getAddress(`0x${'a1'.repeat(20)}`);
 const PAY_B = getAddress(`0x${'b2'.repeat(20)}`);
-const LIMITS: HostedLimits = { minAmount: 1_000n, perMinute: 100, paidPerDay: 100, failedKeysPerMinute: 3 };
+const LIMITS: HostedLimits = { minAmount: 1_000n, perMinute: 100, paidPerDay: 100, paidPerDayTotal: 1_000, failedKeysPerMinute: 3 };
 const isConfig = (e: unknown): boolean => e instanceof AcceptError && e.code === 'CONFIG_INVALID';
 
 const servers: Server[] = [];
@@ -119,14 +119,15 @@ describe('Counters', () => {
 
 describe('parseEnv', () => {
   const KEY = `0x${'ab'.repeat(32)}`;
-  const base = { HUB_DB_PATH: '/var/lib/hub/hub.db', HUB_RPC_URL: 'https://sepolia.base.org', HUB_RELAY_KEY: KEY };
+  const base = { HUB_DB_PATH: '/var/lib/hub/hub.db', HUB_RPC_URL: 'https://sepolia.base.org', HUB_RELAY_KEY: KEY, HUB_TRUSTED_PROXY_HOPS: '0' };
 
-  it('takes the three required variables and defaults the rest', () => {
+  it('takes the four required variables and defaults the rest', () => {
     const env = parseEnv(base);
     assert.equal(env.port, 8787);
     assert.equal(env.host, '127.0.0.1');
     assert.equal(env.trustedProxyHops, 0);
-    assert.deepEqual(env.limits, { minAmount: 1_000n, perMinute: 600, paidPerDay: 10_000, failedKeysPerMinute: 20 });
+    assert.deepEqual(env.limits, { minAmount: 1_000n, perMinute: 600, paidPerDay: 2_000, paidPerDayTotal: 20_000, failedKeysPerMinute: 20 });
+    assert.equal(parseEnv({ ...base, HUB_TRUSTED_PROXY_HOPS: '1' }).trustedProxyHops, 1);
     assert.equal(parseEnv({ ...base, HUB_RPC_URL: 'http://localhost:8545' }).rpcUrl, 'http://localhost:8545/');
     assert.equal(parseEnv({ ...base, HUB_MIN_AMOUNT: '5000', HUB_PORT: '9000' }).limits.minAmount, 5_000n);
   });
@@ -135,6 +136,7 @@ describe('parseEnv', () => {
     const refused = (env: Record<string, string | undefined>, name: string) => assert.throws(() => parseEnv(env), (e: unknown) =>
       isConfig(e) && (e as Error).message.startsWith(name) && !(e as Error).message.includes(KEY.slice(2, 12)));
     refused({ ...base, HUB_DB_PATH: undefined }, 'HUB_DB_PATH');
+    refused({ ...base, HUB_TRUSTED_PROXY_HOPS: undefined }, 'HUB_TRUSTED_PROXY_HOPS');
     refused({ ...base, HUB_RELAY_KEY: KEY.slice(0, -2) }, 'HUB_RELAY_KEY');
     refused({ ...base, HUB_RPC_URL: 'http://rpc.example.com' }, 'HUB_RPC_URL');
     refused({ ...base, HUB_RPC_URL: 'not a url' }, 'HUB_RPC_URL');
@@ -226,6 +228,14 @@ describe('hostedService: POST /api/agent-payments/settle', () => {
     h.advance(60_000);
     assert.equal(codeOf(await seller.handle(get({ 'payment-signature': await payFor(h.buyer, PAY_A, `0x${'05'.repeat(32)}`) }))), 'RATE_LIMITED');
     assert.equal(codeOf(await seller.handle(get())), 'PAYMENT_REQUIRED', 'offers stay open past the daily cap');
+  });
+
+  it('caps paid calls per day over all keys, so many keys do not multiply the relay\'s gas', async () => {
+    const h = await hub({ paidPerDayTotal: 1 });
+    const a = sellerOf(h.url, h.merchants.add('a', PAY_A));
+    const b = sellerOf(h.url, h.merchants.add('b', PAY_B));
+    assert.equal((await a.handle(get({ 'payment-signature': await payFor(h.buyer, PAY_A, `0x${'06'.repeat(32)}`) }))).kind, 'paid');
+    assert.equal(codeOf(await b.handle(get({ 'payment-signature': await payFor(h.buyer, PAY_B, `0x${'07'.repeat(32)}`) }))), 'RATE_LIMITED');
   });
 
   it('reconcile walks every merchant and sweeps ended limit windows', async () => {

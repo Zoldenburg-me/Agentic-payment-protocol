@@ -22,6 +22,8 @@ export interface HostedLimits {
   readonly perMinute: number;
   /** Calls carrying a payment per seller key per 24 h: bounds the gas the relay spends for one key. */
   readonly paidPerDay: number;
+  /** The same over all keys: bounds the relay's gas however many keys a hostile seller holds. */
+  readonly paidPerDayTotal: number;
   /** Failed key lookups per client IP per minute, after which every call from that IP is refused. */
   readonly failedKeysPerMinute: number;
 }
@@ -102,6 +104,8 @@ export function hostedService(o: HostedServiceOptions) {
       if (!counters.take(`minute:${id}`, limits.perMinute, MINUTE_MS, now())) return refusal(E.RATE_LIMITED);
       const paying = req.headers['payment-signature'] !== undefined;
       if (paying && !counters.take(`day:${id}`, limits.paidPerDay, DAY_MS, now())) return refusal(E.RATE_LIMITED);
+      // '*' is no merchant id, so this key is the relay's own
+      if (paying && !counters.take('day:*', limits.paidPerDayTotal, DAY_MS, now())) return refusal(E.RATE_LIMITED);
       return inner.handle(req, options);
     },
   });

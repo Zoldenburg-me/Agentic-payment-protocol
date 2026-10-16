@@ -26,9 +26,10 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
   return value === undefined || value.trim() === '' ? fail(name) : value;
 }
 
-function int(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
+/** `fallback` undefined: the variable is required. */
+function int(env: NodeJS.ProcessEnv, name: string, fallback: number | undefined, min: number, max: number): number {
   const raw = env[name];
-  if (raw === undefined) return fallback;
+  if (raw === undefined) return fallback ?? fail(name);
   const value = UINT.test(raw) ? Number(raw) : NaN;
   return value >= min && value <= max ? value : fail(name);
 }
@@ -56,11 +57,13 @@ export function parseEnv(env: NodeJS.ProcessEnv): HubEnv {
     relayKey: relayKey as `0x${string}`,
     host: env.HUB_HOST ?? '127.0.0.1',
     port: int(env, 'HUB_PORT', 8787, 1, 65_535),
-    trustedProxyHops: int(env, 'HUB_TRUSTED_PROXY_HOPS', 0, 0, 10),
+    // Required: 0 behind a proxy puts every seller on the proxy's IP, so one bad key locks them all out.
+    trustedProxyHops: int(env, 'HUB_TRUSTED_PROXY_HOPS', undefined, 0, 10),
     limits: {
       minAmount: BigInt(minAmount),
       perMinute: int(env, 'HUB_PER_MINUTE', 600, 1, 1_000_000),
-      paidPerDay: int(env, 'HUB_PAID_PER_DAY', 10_000, 1, 10_000_000),
+      paidPerDay: int(env, 'HUB_PAID_PER_DAY', 2_000, 1, 10_000_000),
+      paidPerDayTotal: int(env, 'HUB_PAID_PER_DAY_TOTAL', 20_000, 1, 100_000_000),
       failedKeysPerMinute: int(env, 'HUB_FAILED_KEYS_PER_MINUTE', 20, 1, 10_000),
     },
   };

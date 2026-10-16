@@ -15,14 +15,16 @@ const MAX_GAS = 150_000n;
 const MAX_FEE_PER_GAS = 1_000_000_000n;
 const RECONCILE_EVERY_MS = 60_000;
 
-/** Code and message only: an RPC error's cause may hold the RPC URL and its key. */
-const log = (error: unknown): void => {
-  const e = error as { name?: unknown; code?: unknown; message?: unknown } | undefined;
-  console.error(JSON.stringify({ level: 'error', name: String(e?.name), code: e?.code, message: String(e?.message ?? error) }));
-};
-
 process.umask(0o077); // the database file holds payers' addresses: not world-readable
 const env = parseEnv(process.env);
+
+/** Code and short message only, the RPC URL (which may hold a provider key) blanked: viem puts it in its messages too. */
+const log = (error: unknown): void => {
+  const e = error as { name?: unknown; code?: unknown; shortMessage?: unknown; message?: unknown } | undefined;
+  let message = String(e?.shortMessage ?? e?.message ?? error);
+  for (const url of [env.rpcUrl, process.env.HUB_RPC_URL ?? env.rpcUrl]) message = message.replaceAll(url, '[rpc]');
+  console.error(JSON.stringify({ level: 'error', name: String(e?.name), code: e?.code, message }));
+};
 const db = openSqlite(env.dbPath);
 const merchants = new MerchantStore(db);
 const transport = http(env.rpcUrl);

@@ -15,6 +15,7 @@ const ZERO_ADDRESS = /^0x0{40}$/;
 /** `zsk_<key id>_<secret>`: looked up by the id, the secret compared by its hash. */
 const KEY = /^zsk_([0-9a-f]{16})_([0-9a-f]{64})$/;
 const sha256 = (s: string): Buffer => createHash('sha256').update(s).digest();
+const NO_KEY = Buffer.alloc(32);
 const fail = (what: string): never => {
   throw new AcceptError(E.CONFIG_INVALID, what);
 };
@@ -76,8 +77,9 @@ export class MerchantStore {
     if (parts === null) return undefined;
     const row = this.db.prepare('SELECT id, pay_to, key_hash FROM merchants WHERE key_id = ? AND revoked = 0').get(parts[1] ?? '') as
       { id: string; pay_to: string; key_hash: Uint8Array } | undefined;
-    if (row === undefined || !timingSafeEqual(Buffer.from(row.key_hash), sha256(parts[2] ?? ''))) return undefined;
-    return { id: row.id, payTo: row.pay_to };
+    // An unknown id costs the same compare, so timing does not tell which ids exist.
+    const ok = timingSafeEqual(row === undefined ? NO_KEY : Buffer.from(row.key_hash), sha256(parts[2] ?? ''));
+    return ok && row !== undefined ? { id: row.id, payTo: row.pay_to } : undefined;
   }
 
   /** Revoked merchants count: payments they took before revocation still settle to them. */
