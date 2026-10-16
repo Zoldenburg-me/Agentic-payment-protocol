@@ -26,7 +26,8 @@ const TRANSFER_GAS = 21_000n;
  * earlier run left pending, and an underpriced one would hold the nonce for every merchant. Before serving,
  * wait for the relay to have nothing pending. With `cancel`, nonces still pending after `cancel.afterMs`
  * are each replaced once by a zero-value self-transfer: only one transaction can fill a nonce, so this never
- * pays twice, and a cancelled settlement's authorization stays unused on chain for reconcile or a retry.
+ * pays twice. A cancelled settlement is not resent: its row keeps judging the old hash and expires after
+ * validBefore, so the payer is never charged and the merchant is not paid.
  * If the relay is still not idle after `timeoutMs`, refuse to start rather than queue payments behind it.
  */
 export async function waitForIdleRelay(
@@ -50,7 +51,10 @@ export async function waitForIdleRelay(
     if (pending <= latest) return;
     if (now() >= deadline) {
       const what = `the relay has ${pending - latest} transaction(s) pending from an earlier run (nonces ${latest} to ${pending - 1})`;
-      if (failure !== undefined) throw new AcceptError(E.CONFIG_INVALID, `${what} that could not be replaced (see cause): replace or cancel them, then start again`, { cause: failure });
+      let unreplaced = false;
+      for (let nonce = latest; nonce < pending; nonce += 1) unreplaced ||= !replaced.has(nonce);
+      // A failure explains the refusal only while some pending nonce never got its replacement out.
+      if (unreplaced && failure !== undefined) throw new AcceptError(E.CONFIG_INVALID, `${what} that could not be replaced (see cause): replace or cancel them, then start again`, { cause: failure });
       throw new AcceptError(E.CONFIG_INVALID, `${what}: replace or cancel them, then start again`);
     }
     const cancel = options.cancel;

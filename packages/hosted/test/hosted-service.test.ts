@@ -376,5 +376,17 @@ describe('waitForIdleRelay', () => {
       }),
       (e: unknown) => isConfig(e) && /could not be replaced/.test((e as Error).message) && (e as Error).cause instanceof Error,
     );
+
+    t = 0;
+    let first = true;
+    const flaky = walletOf(() => (first ? ((first = false), new Error('nonce too low')) : undefined));
+    await assert.rejects(
+      waitForIdleRelay(clientOf([{ pending: 8, latest: 7 }]), ADDRESS, {
+        timeoutMs: 8_000, pollMs: 2_000, now: () => t, sleep: async (ms) => { t += ms; },
+        cancel: { wallet: flaky, afterMs: 2_000, maxFeePerGas: 1n },
+      }),
+      (e: unknown) => isConfig(e) && !/could not be replaced/.test((e as Error).message) && (e as Error).cause === undefined,
+    );
+    assert.equal(flaky.sent.length, 1); // sent on the retry, just not mined: the stale error is not the reason
   });
 });
