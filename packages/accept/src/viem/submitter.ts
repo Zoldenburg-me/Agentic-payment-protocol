@@ -14,7 +14,8 @@ export interface ViemSubmitterOptions {
   readonly chainId: number;
   /** The only token this account may call, and the only payee it may move funds to. */
   readonly asset: string;
-  readonly payTo: string;
+  /** One payee, or (a host relaying for many sellers) a check that an address is one of its sellers' payees. */
+  readonly payTo: string | ((to: string) => boolean);
   /** Gas limit cap, at least 50 000. A contract-wallet payer that needs more is refused before sending. */
   readonly maxGas: bigint;
   /**
@@ -58,6 +59,21 @@ interface Signed {
   readonly accepted: boolean;
 }
 
+/** A failing or non-boolean check refuses: nothing is sent to a payee it could not confirm. */
+function payeeCheck(payTo: ViemSubmitterOptions['payTo']): (to: string) => boolean {
+  if (typeof payTo !== 'function') {
+    const pinned = address(payTo, 'payTo');
+    return (to) => sameAddress(to, pinned);
+  }
+  return (to) => {
+    try {
+      return payTo(to) === true;
+    } catch {
+      return false;
+    }
+  };
+}
+
 /**
  * Broadcasts `transferWithAuthorization` on the pinned asset to the pinned payee, under gas and fee caps.
  * One authorization is signed into exactly one transaction: a retry rebroadcasts those same bytes, so a
@@ -77,7 +93,7 @@ export function viemSubmitter(options: ViemSubmitterOptions): Submitter {
   if (typeof client?.estimateGas !== 'function' || typeof client.getTransactionCount !== 'function') fail('client');
   const chainId = options.chainId;
   const asset = address(options.asset, 'asset');
-  const payTo = address(options.payTo, 'payTo');
+  const isPayee = payeeCheck(options.payTo);
   const maxGas = bigintAtLeast(options.maxGas, MIN_GAS, 'maxGas');
   const maxFeePerGas = bigintAtLeast(options.maxFeePerGas, 1n, 'maxFeePerGas');
   const timeoutMs = positiveInt(options.timeoutMs, 30_000, 600_000, 'timeoutMs');
@@ -263,7 +279,7 @@ export function viemSubmitter(options: ViemSubmitterOptions): Submitter {
       return withDeadline(replacing, timeoutMs, 'replaceStuck');
     },
     submit(call) {
-      if (!sameAddress(call.asset, asset) || !sameAddress(call.authorization.to, payTo)) {
+      if (!sameAddress(call.asset, asset) || !isPayee(call.authorization.to)) {
         return Promise.reject(new ChainRevertError('refused before sending: not the pinned asset and payee'));
       }
       forgetExpired();
