@@ -200,7 +200,7 @@ npm run build
 ## Roadmap
 
 1. Run seller settlement on Base Sepolia, then mainnet.
-2. A durable `SellerLedgerPort` (Postgres) for production self-hosting.
+2. A Postgres `SellerLedgerPort` for sellers running on more than one host (SQLite covers one host).
 3. ACP and UCP checkout on the seller side, backed by the merchant's existing Stripe account, so
    agents can place orders and bookings, not just pay per request.
 4. MPP acceptance; a real MPP signer on the buyer side.
