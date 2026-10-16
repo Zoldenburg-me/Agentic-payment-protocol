@@ -224,6 +224,17 @@ describe('viemSubmitter', () => {
     assert.equal(rpc.calls.length, 0);
   });
 
+  it('a payee check (a host relaying for many sellers) refuses, before any RPC, a payee it does not confirm', async () => {
+    const rpc = estimating(80_000n);
+    const throwing = submitterOf(rpc, { payTo: () => { throw new Error('store down'); } });
+    await assert.rejects(throwing.submit(call()), ChainRevertError);
+    await assert.rejects(submitterOf(rpc, { payTo: () => 'yes' }).submit(call()), ChainRevertError);
+    const s = submitterOf(rpc, { payTo: (to: string) => to.toLowerCase() === PAY_TO.toLowerCase() });
+    await assert.rejects(s.submit(call({ to: PAYER })), ChainRevertError);
+    assert.equal(rpc.calls.length, 0);
+    assert.match(await s.submit(call()), /^0x[0-9a-f]{64}$/);
+  });
+
   it('a gas estimate above maxGas is refused before sending (a hostile contract wallet)', async () => {
     const rpc = estimating(2_000_000n);
     await assert.rejects(submitterOf(rpc).submit(call()), (e: unknown) => e instanceof ChainRevertError && /gas/.test(e.message));

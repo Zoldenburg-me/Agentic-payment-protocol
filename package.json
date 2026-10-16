@@ -8,13 +8,15 @@
     "agentpay-mcp": "dist/mcp/server.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && tsc -p packages/accept/tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tsc -p packages/accept/tsconfig.build.json && tsc -p packages/hosted/tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "node --conditions=agentpay-source --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\" \"packages/*/test/**/*.test.ts\"",
+    "hub": "node --conditions=agentpay-source --import tsx packages/hosted/src/main.ts",
+    "hub:merchant": "node --conditions=agentpay-source --import tsx packages/hosted/src/cli.ts",
     "mcp": "tsx src/mcp/server.ts",
     "demo": "tsx examples/demo.ts",
     "pay": "tsx examples/pay-url.ts",
-    "coverage": "c8 --check-coverage --lines 80 --branches 80 --functions 80 --include \"src/**\" --include \"packages/*/src/**\" --exclude \"src/mcp/server.ts\" --reporter text-summary --reporter text node --conditions=agentpay-source --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\" \"packages/*/test/**/*.test.ts\"",
+    "coverage": "c8 --check-coverage --lines 80 --branches 80 --functions 80 --include \"src/**\" --include \"packages/*/src/**\" --exclude \"src/mcp/server.ts\" --exclude \"packages/hosted/src/main.ts\" --exclude \"packages/hosted/src/cli.ts\" --reporter text-summary --reporter text node --conditions=agentpay-source --import tsx --test --test-timeout=20000 \"test/**/*.test.ts\" \"packages/*/test/**/*.test.ts\"",
     "prepack": "tsc -p tsconfig.build.json",
     "pack:private": "node scripts/pack-private.mjs"
   },

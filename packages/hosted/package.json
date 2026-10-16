@@ -1,0 +1,21 @@
+{
+  "name": "@zold/hosted",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The hub's hosted settlement service: POST /api/agent-payments/settle for zoldSeller, Base Sepolia only.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@zold/accept": "file:../accept",
+    "agentpay-hub": "file:../..",
+    "viem": "^2.57.3"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "merchant": "node dist/cli.js"
+  }
+}
