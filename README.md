@@ -117,7 +117,7 @@ claims store refuses new payments rather than forget one.
   delivered before your route runs, so the route runs once unreplayed even if the payer sends one
   header in parallel; a route that throws leaves the payer paid with nothing delivered. With
   `nodeHandler(acceptor, onPaid, { deferDelivery: true })` (or the same option on `expressPayment`) it
-  is marked only after `onPaid` resolves (Express: the response finishes below 400). A throw, crash or
+  is marked only once the response finishes with a status below 400. A throw, crash or
   client abort then leaves it in `ledger.undelivered()` and a retry is handed out again; the cost is that
   concurrent requests can all see `replayed: false`, so your side effect must be idempotent by
   `paid.claimKey`. Using `handle` directly: `handle(req, { deferDelivery: true })`, then
@@ -231,7 +231,7 @@ To use the tarballs in another project, vendor both and point npm at them, so it
 `agentpay-hub` on a registry:
 
 ```json
-"dependencies": { "@zold/accept": "file:vendor/zold-accept-0.1.0.tgz", "agentpay-hub": "file:vendor/agentpay-hub-0.1.0.tgz" },
+"dependencies": { "@zold/accept": "file:vendor/zold-accept-0.2.0.tgz", "agentpay-hub": "file:vendor/agentpay-hub-0.1.0.tgz" },
 "overrides": { "agentpay-hub": "file:vendor/agentpay-hub-0.1.0.tgz" }
 ```
 

@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { PaidContext, PaymentHandler } from '../accept.js';
 import { AcceptError, AcceptErrorCode as E } from '../errors.js';
-import { type NodeHandlerOptions, confirmDelivered, defers, internalError, toReqLike } from './node-http.js';
+import { type NodeHandlerOptions, confirmOnFinish, defers, internalError, toReqLike } from './node-http.js';
 
 /** The parts of an Express request and response the adapter uses (Express 4 and 5). */
 export interface ExpressRequest extends IncomingMessage {
@@ -37,11 +37,7 @@ export function expressPayment(acceptor: PaymentHandler, options: NodeHandlerOpt
         for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
         res.locals[LOCALS_KEY] = result.paid;
         // Delivered only once the route answered with a success: an error or an aborted response stays owed.
-        if (defer) {
-          res.once('finish', () => {
-            if (res.statusCode < 400) void confirmDelivered(acceptor, result.paid.claimKey);
-          });
-        }
+        if (defer) confirmOnFinish(acceptor, res, result.paid.claimKey);
         next();
       })
       .catch((error: unknown) => {

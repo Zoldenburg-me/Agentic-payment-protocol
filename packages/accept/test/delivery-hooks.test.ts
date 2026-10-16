@@ -88,8 +88,32 @@ describe('deferred delivery', () => {
     fail = false;
     const retry = await fetch(`${url}/rates`, { headers: { 'payment-signature': header } });
     assert.equal(retry.status, 200);
-    assert.equal((await s.ledger.get(row!.claimKey))?.delivered, true);
+    assert.ok(await eventually(async () => (await s.ledger.get(row!.claimKey))?.delivered === true));
     assert.equal(s.chain.submissions.length, 1, 'the retry did not pay again');
+  });
+
+  it('nodeHandler with deferDelivery does not count an error status, and waits for a late finish', async () => {
+    const s = setup();
+    let mode: 'error' | 'late' = 'error';
+    let finishLate: () => void = () => undefined;
+    const url = await listen(nodeHandler(s.acceptor, (_req, res) => {
+      if (mode === 'error') return void res.writeHead(500).end();
+      res.writeHead(200);
+      finishLate = () => res.end('ok'); // onPaid returns before the response is finished
+    }, { deferDelivery: true }));
+    const header = await payHeader(s.buyer);
+    assert.equal((await fetch(`${url}/rates`, { headers: { 'payment-signature': header } })).status, 500);
+    const [row] = await s.ledger.list();
+    await tick();
+    assert.equal((await s.ledger.get(row!.claimKey))?.delivered, false, 'a 500 is not a delivery');
+
+    mode = 'late';
+    const pending = fetch(`${url}/rates`, { headers: { 'payment-signature': header } });
+    await new Promise((r) => setTimeout(r, 50)); // the request has reached onPaid and settled by now
+    assert.equal((await s.ledger.get(row!.claimKey))?.delivered, false, 'not before the response finished');
+    finishLate();
+    assert.equal((await pending).status, 200);
+    assert.ok(await eventually(async () => (await s.ledger.get(row!.claimKey))?.delivered === true));
   });
 
   it('expressPayment with deferDelivery marks delivery only once the route answered below 400', async () => {
