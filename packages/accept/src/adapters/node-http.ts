@@ -11,6 +11,14 @@ export interface NodeHandlerOptions {
    * proxies, or a client can write its own X-Forwarded-For entry and pick its rate-limit bucket.
    */
   readonly trustedProxyHops?: number;
+  /**
+   * Mark a payment delivered only once your response finished below 400 (needs an Acceptor, not `zoldSeller`).
+   * A route that throws, a crash or a client abort then leaves it in `ledger.undelivered()` for a retry
+   * or your sweep. The price: until one delivery succeeds, every concurrent request with the same
+   * header gets `replayed: false`, so your side effect must be idempotent by `paid.claimKey`.
+   * Default false: delivery is marked before your route runs, so it runs at most once (as in 0.1).
+   */
+  readonly deferDelivery?: boolean;
 }
 
 export type OnPaid = (req: IncomingMessage, res: ServerResponse, paid: PaidContext) => void | Promise<void>;
@@ -53,13 +61,32 @@ export function internalError(res: ServerResponse): void {
   res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'INTERNAL' }));
 }
 
+/** Whether this adapter defers delivery: asked for, and the handler can confirm it. */
+export const defers = (acceptor: PaymentHandler, options: NodeHandlerOptions): boolean =>
+  options.deferDelivery === true && acceptor.confirmDelivery !== undefined;
+
+/**
+ * Records the delivery once the response has finished with a status below 400. An error status, an
+ * aborted response or a failed write leaves the row in ledger.undelivered() for a retry or your sweep.
+ */
+export function confirmOnFinish(acceptor: PaymentHandler, res: ServerResponse, claimKey: string): void {
+  res.once('finish', () => {
+    if (res.statusCode >= 400 || !acceptor.confirmDelivery) return;
+    acceptor.confirmDelivery(claimKey).catch((error: unknown) => {
+      acceptor.reportError(new AcceptError(E.INTERNAL, `payment ${claimKey} was delivered but recording it failed`, { cause: error }));
+    });
+  });
+}
+
 async function serve(acceptor: PaymentHandler, onPaid: OnPaid, options: NodeHandlerOptions, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const result = await acceptor.handle(toReqLike(req, options));
+  const defer = defers(acceptor, options);
+  const result = await acceptor.handle(toReqLike(req, options), { deferDelivery: defer });
   if (result.kind === 'respond') {
     res.writeHead(result.status, result.headers).end(result.body);
     return;
   }
   for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
+  if (defer) confirmOnFinish(acceptor, res, result.paid.claimKey);
   try {
     await onPaid(req, res, result.paid);
   } catch (error) {
@@ -69,7 +96,10 @@ async function serve(acceptor: PaymentHandler, onPaid: OnPaid, options: NodeHand
   }
 }
 
-/** A `node:http` request listener: answers 402s and refusals itself, calls `onPaid` once a payment is accepted. */
+/**
+ * A `node:http` request listener: answers 402s and refusals itself, calls `onPaid` once a payment is accepted.
+ * With `deferDelivery`, the payment is marked delivered only once the response finishes below 400.
+ */
 export function nodeHandler(acceptor: PaymentHandler, onPaid: OnPaid, options: NodeHandlerOptions = {}) {
   return (req: IncomingMessage, res: ServerResponse): void => {
     serve(acceptor, onPaid, options, req, res).catch((error: unknown) => {

@@ -10,6 +10,7 @@ import { type AcceptConfig, type AcceptOptions, type Price, parseAcceptOptions }
 import { AcceptError, AcceptErrorCode as E, type AcceptErrorCode, statusFor } from './errors.js';
 import { MemoryRateLimiter } from './memory/rate-limit.js';
 import { offerHeader, paymentResponseHeader } from './offer.js';
+import { redactError } from './redact.js';
 import type { ChainPort, NewSellerPayment, RateLimiter, SellerLedgerPort, SellerPayment, Submitter, TransferCall } from './ports.js';
 import { type Expected, type SettleEnv, type SettleFailure, confirm, expectedOf, precheck, submit } from './settle.js';
 
@@ -41,8 +42,10 @@ export interface PaidContext {
   /** False only for optimistic delivery: the transfer was sent but not yet confirmed. */
   readonly settled: boolean;
   /**
-   * True when this payment was handed out for delivery before (a retry, perhaps after a failed
-   * delivery): serve the same resource again, keyed by claimKey, and repeat no side effects.
+   * True when this payment was delivered before (a retry, perhaps after a failed delivery): serve the
+   * same resource again, keyed by claimKey, and repeat no side effects. With `deferDelivery` it turns
+   * true only after `confirmDelivery`, so two concurrent retries can both see false: key your side
+   * effect by claimKey so doing it twice is harmless.
    */
   readonly replayed: boolean;
 }
@@ -59,7 +62,8 @@ export interface AcceptDeps {
   /**
    * Required: internal failures, ledger errors, ambiguous settlements and optimistic deliveries that
    * did not settle (an AcceptError with the code) all land here, since no request is left to answer
-   * them. RPC errors arrive as the `cause` and may contain your RPC URL: redact before logging.
+   * them. Every URL in the error (message, stack, causes) is cut to scheme and host first, so an
+   * RPC key in the URL never reaches it; the payer's address may still appear in messages.
    */
   readonly onError: (error: unknown) => void;
   readonly rateLimiter?: RateLimiter;
@@ -70,12 +74,26 @@ export interface AcceptDeps {
 export interface HandleOptions {
   /** Price this request with this instead of the configured price function (a host settling for many sellers). */
   readonly price?: Price;
+  /**
+   * Leave the payment undelivered: call `confirmDelivery(paid.claimKey)` once your side effect
+   * succeeded. A failed or crashed delivery then stays in `ledger.undelivered()` and a retry is
+   * handed out again. Default false: delivery is marked before `handle` returns (as in 0.1).
+   */
+  readonly deferDelivery?: boolean;
 }
 
 export interface Acceptor {
   handle(req: ReqLike, options?: HandleOptions): Promise<AcceptResult>;
   /** Hands an error to `onError` (adapters use it for delivery failures). Never throws. */
   reportError(error: unknown): void;
+  /** Marks a payment handed out with `deferDelivery` as delivered; `first` is false if it already was. */
+  confirmDelivery(claimKey: string): Promise<{ readonly first: boolean }>;
+  /**
+   * The stored payment for a PAYMENT-SIGNATURE header exactly as sent, if any. A retry priced from
+   * time or state can pass `{ amount: BigInt(row.amount), meta: row.meta }` as its price, so it
+   * matches the original instead of failing with NONCE_REPLAY. Unverified: use it only to price.
+   */
+  lookup(header: string): Promise<SellerPayment | undefined>;
   /**
    * Settles, expires or reports open payments without a request: those whose request timed out, or
    * whose payer never came back. Run it on a timer (e.g. every minute) in one process. It first asks
@@ -97,6 +115,8 @@ interface Ctx {
   readonly active: Set<string>;
   /** Per payer (lower-case): the value of its payments this process is still settling. */
   readonly unsettled: Map<string, bigint>;
+  /** This request leaves delivery to `confirmDelivery`. */
+  readonly deferDelivery?: boolean;
 }
 
 const READ_ONLY = new Set(['GET', 'HEAD']);
@@ -111,7 +131,7 @@ const reporterFailed = (): void =>
 
 function report(ctx: Ctx, error: unknown): void {
   try {
-    const result: unknown = ctx.deps.onError(error);
+    const result: unknown = ctx.deps.onError(redactError(error));
     if (typeof (result as PromiseLike<unknown> | undefined)?.then === 'function') {
       (result as PromiseLike<unknown>).then(undefined, reporterFailed);
     }
@@ -222,6 +242,11 @@ function paidResult(ctx: Ctx, row: SellerPayment, settled: boolean, replayed: bo
 }
 
 async function deliver(ctx: Ctx, claimKey: string, settled: boolean): Promise<AcceptResult> {
+  if (ctx.deferDelivery) {
+    const row = await ctx.deps.ledger.get(claimKey);
+    if (!row) throw new AcceptError(E.LEDGER_TRANSITION, 'unknown seller payment');
+    return paidResult(ctx, row, settled, row.delivered);
+  }
   const { first, row } = await ctx.deps.ledger.markDelivered(claimKey);
   return paidResult(ctx, row, settled, !first);
 }
@@ -689,8 +714,11 @@ async function handlePayment(ctx: Ctx, req: ReqLike, given: Price | undefined): 
   return verifyAndClaim(ctx, req, price, sig, digest);
 }
 
-/** What an adapter needs: answer requests, report delivery failures. Both an Acceptor and `zoldSeller` are one. */
-export type PaymentHandler = Pick<Acceptor, 'handle' | 'reportError'>;
+/**
+ * What an adapter needs: answer requests, report delivery failures. Both an Acceptor and `zoldSeller` are
+ * one. With `confirmDelivery` the adapters defer delivery until the route succeeded.
+ */
+export type PaymentHandler = Pick<Acceptor, 'handle' | 'reportError'> & Partial<Pick<Acceptor, 'confirmDelivery'>>;
 
 /** The framework-neutral core. Wrap `handle` with an adapter (e.g. `nodeHandler`). */
 export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
@@ -707,7 +735,7 @@ export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
   return {
     async handle(req, options) {
       try {
-        return await handlePayment(ctx, req, options?.price);
+        return await handlePayment(options?.deferDelivery === true ? { ...ctx, deferDelivery: true } : ctx, req, options?.price);
       } catch (error) {
         report(ctx, error);
         return respond(ctx, E.INTERNAL, req);
@@ -715,6 +743,21 @@ export function accept(options: AcceptOptions, deps: AcceptDeps): Acceptor {
     },
     reportError(error) {
       report(ctx, error);
+    },
+    async confirmDelivery(claimKey) {
+      const { first } = await ctx.deps.ledger.markDelivered(claimKey);
+      return { first };
+    },
+    async lookup(header) {
+      let sig: PaymentSignature;
+      try {
+        sig = decodePaymentSignature(header);
+      } catch {
+        return undefined;
+      }
+      const key = claimedKey(config, sig);
+      const row = key === undefined ? undefined : await ctx.deps.ledger.get(key);
+      return row?.headerDigest === sha256(header) ? row : undefined;
     },
     reconcileOwed: () => reconcileOwed(ctx),
     async idle() {

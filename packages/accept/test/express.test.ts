@@ -108,6 +108,8 @@ describe('Express adapter', () => {
       reportError: (e) => { reported.push(e); },
       reconcileOwed: () => Promise.reject(new Error('unused')),
       idle: () => Promise.resolve(),
+      confirmDelivery: () => Promise.reject(new Error('unused')),
+      lookup: () => Promise.reject(new Error('unused')),
     };
     let reachedExpress = false;
     const url = await app('', [expressPayment(broken)], [() => { reachedExpress = true; }]);

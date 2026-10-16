@@ -125,4 +125,12 @@ export interface SellerLedgerPort {
   recordRefused(claimKey: string, code: AcceptErrorCode, txHash?: string): Promise<SellerPayment>;
   /** Sets the delivery flag; `first` is false if it was already set. */
   markDelivered(claimKey: string): Promise<{ readonly first: boolean; readonly row: SellerPayment }>;
+  /** Optional: settled rows not yet delivered (a failed or crashed delivery), oldest first. Deliver them, then markDelivered. */
+  undelivered?(): Promise<readonly SellerPayment[]>;
+  /**
+   * Optional: deletes finished rows (refused, or settled and delivered) whose validBefore is before
+   * `beforeUnixS` (unix seconds, not after now); returns how many. Open and settled-undelivered rows are kept. A pruned payment's
+   * retry gets NONCE_REPLAY (or EXPIRED) instead of a replay, so keep rows as long as retries matter.
+   */
+  prune?(beforeUnixS: number): Promise<number>;
 }

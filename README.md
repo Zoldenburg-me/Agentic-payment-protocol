@@ -113,12 +113,48 @@ claims store refuses new payments rather than forget one.
 - **Each payment is delivered once.** Payments are claimed by authorization nonce. A retry of a payment
   that was already delivered comes back with `paid.replayed = true`: serve the same resource again,
   keyed by `paid.claimKey`, and repeat no side effects.
+- **At most once by default; opt in to delivery after success.** By default a payment is marked
+  delivered before your route runs, so the route runs once unreplayed even if the payer sends one
+  header in parallel; a route that throws leaves the payer paid with nothing delivered. With
+  `nodeHandler(acceptor, onPaid, { deferDelivery: true })` (or the same option on `expressPayment`) it
+  is marked only once the response finishes with a status below 400. A throw, crash or
+  client abort then leaves it in `ledger.undelivered()` and a retry is handed out again; the cost is that
+  concurrent requests can all see `replayed: false`, so your side effect must be idempotent by
+  `paid.claimKey`. Using `handle` directly: `handle(req, { deferDelivery: true })`, then
+  `acceptor.confirmDelivery(paid.claimKey)` after your side effect.
 - **Settle, then deliver.** By default the route runs only after the transfer has 2 confirmations.
   `optimistic` delivery (GET/HEAD only, up to $0.50) is opt-in.
 - **Built-in limits.** Per-IP and per-payer rate limits, a cap on settlements in flight (503 BUSY
   beyond it), and a 4-minute maximum offer validity.
 - **Strict config.** Unknown options, out-of-range numbers and tokens without a pinned EIP-712 domain
   are errors, never silent defaults.
+- **RPC keys stay out of `onError`.** Every URL in a reported error (message, stack, causes, viem's
+  `url`/`details`) is cut to scheme and host. `redactUrls` is exported for your own logs.
+
+### The settlement wait and client timeouts
+
+A paid request is answered only after settlement: up to `settlementTimeoutMs` (default 60 s), which
+covers being mined *and* `minConfirmations` (default 2), plus the broadcast before it. Set every timeout
+between the payer and this server (the agent's HTTP client, your proxy or load balancer, an MCP tool
+call) above that, e.g. 75–90 s with the defaults. If the wait runs out first, or the client gives up,
+nothing is lost: the payment stays open, the request answers 503 `SETTLEMENT_TIMEOUT` (or the client
+sees its own timeout), and the agent should **retry with the same PAYMENT-SIGNATURE**, never sign a new
+one. The retry answers 409 `IN_PROGRESS` while another request settles it, and delivers once settled.
+`reconcileOwed()` settles payments whose payer never comes back. A shorter `settlementTimeoutMs` answers
+sooner but more often with 503; it never makes a payment settle faster.
+
+### Retries, delivery sweeps and retention
+
+- **Price a retry as it was paid.** If your price depends on time or state, a retry may price
+  differently and fail with `NONCE_REPLAY`. `await acceptor.lookup(header)` returns the stored row for
+  that exact header; pass `{ amount: BigInt(row.amount), meta: row.meta }` as `handle`'s `price`.
+- **Deliver what was paid but not delivered.** `ledger.undelivered()` (memory and SQLite) lists settled
+  payments not marked delivered (with `deferDelivery`: whose delivery never succeeded). Deliver each (idempotently, by `claimKey`), then
+  `ledger.markDelivered(claimKey)`. Run it after `reconcileOwed()`.
+- **Prune old rows.** `ledger.prune(beforeUnixS)` deletes refused and delivered rows whose authorization
+  expired before the cutoff, in unix seconds and not after now, e.g.
+  `ledger.prune(Math.floor(Date.now() / 1000) - 90 * 86_400)`. Open and undelivered rows are kept.
+  A retry of a pruned payment gets `NONCE_REPLAY` instead of a replay.
 
 ## The buyer side: `agentpay-hub`
 
@@ -195,7 +231,7 @@ To use the tarballs in another project, vendor both and point npm at them, so it
 `agentpay-hub` on a registry:
 
 ```json
-"dependencies": { "@zold/accept": "file:vendor/zold-accept-0.1.0.tgz", "agentpay-hub": "file:vendor/agentpay-hub-0.1.0.tgz" },
+"dependencies": { "@zold/accept": "file:vendor/zold-accept-0.2.0.tgz", "agentpay-hub": "file:vendor/agentpay-hub-0.1.0.tgz" },
 "overrides": { "agentpay-hub": "file:vendor/agentpay-hub-0.1.0.tgz" }
 ```
 

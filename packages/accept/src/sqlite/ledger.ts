@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { AcceptError, AcceptErrorCode as E, type AcceptErrorCode } from '../errors.js';
 import type { NewSellerPayment, SellerLedgerPort, SellerPayment, SellerPaymentStatus } from '../ports.js';
-import { FROM, freeze } from '../memory/ledger.js';
+import { FROM, checkCutoff, freeze } from '../memory/ledger.js';
 
 interface Stored {
   readonly status: SellerPaymentStatus;
@@ -24,7 +24,8 @@ export class SqliteSellerLedger implements SellerLedgerPort {
       status TEXT NOT NULL,
       delivered INTEGER NOT NULL,
       row TEXT NOT NULL
-    )`);
+    );
+    CREATE INDEX IF NOT EXISTS seller_payments_status ON seller_payments (status, delivered)`);
   }
 
   async get(claimKey: string): Promise<SellerPayment | undefined> {
@@ -35,6 +36,20 @@ export class SqliteSellerLedger implements SellerLedgerPort {
   async list(): Promise<readonly SellerPayment[]> {
     return this.db.prepare('SELECT status, delivered, row FROM seller_payments ORDER BY seq').all()
       .map((s) => read(s as unknown as Stored));
+  }
+
+  async undelivered(): Promise<readonly SellerPayment[]> {
+    return this.db.prepare("SELECT status, delivered, row FROM seller_payments WHERE status = 'settled' AND delivered = 0 ORDER BY seq").all()
+      .map((s) => read(s as unknown as Stored));
+  }
+
+  async prune(beforeUnixS: number): Promise<number> {
+    checkCutoff(beforeUnixS);
+    const { changes } = this.db.prepare(
+      `DELETE FROM seller_payments WHERE (status = 'refused' OR (status = 'settled' AND delivered = 1))
+        AND CAST(json_extract(row, '$.validBefore') AS INTEGER) < ?`,
+    ).run(beforeUnixS);
+    return Number(changes);
   }
 
   async recordVerified(row: NewSellerPayment): Promise<{ created: boolean; row: SellerPayment }> {

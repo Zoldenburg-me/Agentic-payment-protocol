@@ -152,7 +152,7 @@ describe('reconcileOwed re-prices stuck transactions first', () => {
     assert.deepEqual(await r.acceptor.reconcileOwed(), { checked: 0, settled: 0, refused: 0, open: 0 });
     assert.deepEqual(codesOf(r.errors), [E.SUBMIT_FAILED]);
     assert.doesNotMatch((r.errors[0] as Error).message, /SECRETKEY/);
-    assert.equal((r.errors[0] as Error).cause, cause);
+    assert.equal(((r.errors[0] as Error).cause as Error).message, 'fetch failed: https://rpc.example', 'the cause arrives redacted');
   });
 
   it('prunes expired payment claims, so a long-running seller never fills the store', async () => {
@@ -185,7 +185,8 @@ describe('reconcileOwed re-prices stuck transactions first', () => {
     const cause = new Error('store offline');
     const r = setup({}, {}, { claims: { claim: (k, e) => s.claims.claim(k, e), release: (k, t) => s.claims.release(k, t), prune: () => Promise.reject(cause) } });
     assert.deepEqual(await r.acceptor.reconcileOwed(), { checked: 0, settled: 0, refused: 0, open: 0 });
-    assert.deepEqual(r.errors, [cause]);
+    assert.equal(r.errors.length, 1);
+    assert.ok(r.errors[0] instanceof Error && r.errors[0].message === cause.message, 'a redacted copy of the error');
   });
 
   it('nothing is reported when every stuck transaction was replaced', async () => {
