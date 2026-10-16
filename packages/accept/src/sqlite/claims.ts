@@ -25,13 +25,26 @@ export class SqliteSingleUseStore implements SingleUseStore {
   async claim(key: string, expiresAtSec: number): Promise<ClaimResult> {
     if (!Number.isInteger(expiresAtSec)) throw new ProtocolError(ProtocolErrorCode.MALFORMED, 'claim expiry must be an integer');
     const token = randomUUID();
-    // One statement, so the cap check and the insert are atomic across processes on the file.
-    const { changes } = this.db.prepare(`INSERT INTO single_use_claims (key, token, expires_at)
-      SELECT ?, ?, ? WHERE (SELECT COUNT(*) FROM single_use_claims) < ? ON CONFLICT (key) DO NOTHING`)
-      .run(key, token, expiresAtSec, this.maxEntries);
-    if (changes === 1) return { ok: true, token };
-    const taken = this.db.prepare('SELECT 1 FROM single_use_claims WHERE key = ?').get(key) !== undefined;
-    return { ok: false, code: taken ? ProtocolErrorCode.NONCE_REPLAY : ProtocolErrorCode.STORE_FULL };
+    // BEGIN IMMEDIATE takes the write lock first, so the checks and the insert are atomic across processes on the file.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.claimLocked(key, token, expiresAtSec);
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private claimLocked(key: string, token: string, expiresAtSec: number): ClaimResult {
+    if (this.db.prepare('SELECT 1 FROM single_use_claims WHERE key = ?').get(key) !== undefined) {
+      return { ok: false, code: ProtocolErrorCode.NONCE_REPLAY };
+    }
+    const { n } = this.db.prepare('SELECT COUNT(*) AS n FROM single_use_claims').get() as { n: number };
+    if (n >= this.maxEntries) return { ok: false, code: ProtocolErrorCode.STORE_FULL };
+    this.db.prepare('INSERT INTO single_use_claims (key, token, expires_at) VALUES (?, ?, ?)').run(key, token, expiresAtSec);
+    return { ok: true, token };
   }
 
   async release(key: string, token: string): Promise<boolean> {
