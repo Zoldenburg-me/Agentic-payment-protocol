@@ -185,9 +185,18 @@ To add a protocol, implement `ProtocolAdapter` (`src/types.ts`) and add it to `D
 
 ```bash
 npm install
-npm test          # 509 tests, buyer and seller
+npm test          # 565 tests, buyer and seller
 npm run demo      # the hub paying a local mock merchant
 npm run build
+npm run pack:private   # dist-pack/: agentpay-hub and @zold/accept tarballs, not published
+```
+
+To use the tarballs in another project, vendor both and point npm at them, so it never looks for
+`agentpay-hub` on a registry:
+
+```json
+"dependencies": { "@zold/accept": "file:vendor/zold-accept-0.1.0.tgz", "agentpay-hub": "file:vendor/agentpay-hub-0.1.0.tgz" },
+"overrides": { "agentpay-hub": "file:vendor/agentpay-hub-0.1.0.tgz" }
 ```
 
 | Path | What it is |

@@ -14,3 +14,4 @@ data/
 # Internal notes, never published
 PRODUCT-BRIEF.md
 .claude/plans/
+dist-pack/
