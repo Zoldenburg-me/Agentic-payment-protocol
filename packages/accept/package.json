@@ -9,7 +9,15 @@
       "agentpay-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./sqlite": {
+      "agentpay-source": "./src/sqlite/index.ts",
+      "types": "./dist/sqlite/index.d.ts",
+      "default": "./dist/sqlite/index.js"
     }
+  },
+  "engines": {
+    "node": ">=22.13"
   },
   "license": "UNLICENSED",
   "dependencies": {

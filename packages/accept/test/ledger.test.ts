@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { AcceptErrorCode as E, MemorySellerLedger, type NewSellerPayment } from '../src/index.js';
+import { AcceptErrorCode as E, MemorySellerLedger, type NewSellerPayment, type SellerLedgerPort } from '../src/index.js';
+import { SqliteSellerLedger, openSqlite } from '../src/sqlite/index.js';
 import { CHAIN_ID, PAY_TO, USDC } from './helpers.js';
 
 const row = (claimKey = 'k1'): NewSellerPayment => ({
@@ -10,9 +11,14 @@ const row = (claimKey = 'k1'): NewSellerPayment => ({
 });
 const TX = `0x${'aa'.repeat(32)}` as const;
 
-describe('MemorySellerLedger', () => {
+const LEDGERS: readonly [string, () => SellerLedgerPort][] = [
+  ['MemorySellerLedger', () => new MemorySellerLedger()],
+  ['SqliteSellerLedger', () => new SqliteSellerLedger(openSqlite(':memory:'))],
+];
+
+for (const [name, make] of LEDGERS) describe(name, () => {
   it('records a verified payment as owed, once', async () => {
-    const l = new MemorySellerLedger();
+    const l = make();
     const first = await l.recordVerified(row());
     assert.equal(first.created, true);
     assert.equal(first.row.status, 'owed');
@@ -23,7 +29,7 @@ describe('MemorySellerLedger', () => {
   });
 
   it('moves forward only: owed → submitted → settled', async () => {
-    const l = new MemorySellerLedger();
+    const l = make();
     await l.recordVerified(row());
     assert.equal((await l.recordSubmitted('k1', TX)).status, 'submitted');
     assert.equal((await l.recordSettled('k1', TX)).status, 'settled');
@@ -32,7 +38,7 @@ describe('MemorySellerLedger', () => {
   });
 
   it('allows settling straight from owed (front-run) and refusing from owed or submitted', async () => {
-    const l = new MemorySellerLedger();
+    const l = make();
     await l.recordVerified(row('a'));
     assert.equal((await l.recordSettled('a', TX)).status, 'settled');
     await l.recordVerified(row('b'));
@@ -44,7 +50,7 @@ describe('MemorySellerLedger', () => {
   });
 
   it('marks delivery exactly once', async () => {
-    const l = new MemorySellerLedger();
+    const l = make();
     await l.recordVerified(row());
     await l.recordSettled('k1', TX);
     assert.equal((await l.markDelivered('k1')).first, true);
@@ -52,26 +58,26 @@ describe('MemorySellerLedger', () => {
   });
 
   it('never marks a refused, undelivered payment as delivered', async () => {
-    const l = new MemorySellerLedger();
+    const l = make();
     await l.recordVerified(row());
     await l.recordRefused('k1', E.SUBMIT_FAILED);
     await assert.rejects(l.markDelivered('k1'), { code: E.LEDGER_TRANSITION });
   });
 
   it('refuses transitions for unknown rows', async () => {
-    const l = new MemorySellerLedger();
+    const l = make();
     await assert.rejects(l.markDelivered('nope'), { code: E.LEDGER_TRANSITION });
   });
 
   it('hands out immutable snapshots', async () => {
-    const l = new MemorySellerLedger();
+    const l = make();
     const { row: r } = await l.recordVerified(row());
     assert.throws(() => { (r as { status: string }).status = 'settled'; });
     assert.equal((await l.get('k1'))?.status, 'owed');
   });
 
   it('lists rows in insertion order', async () => {
-    const l = new MemorySellerLedger();
+    const l = make();
     await l.recordVerified(row('a'));
     await l.recordVerified(row('b'));
     assert.deepEqual((await l.list()).map((r) => r.claimKey), ['a', 'b']);

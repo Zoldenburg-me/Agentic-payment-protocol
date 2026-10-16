@@ -1,6 +1,6 @@
 import type { RateLimiter } from '../ports.js';
 
-const WINDOW_MS = 60_000;
+export const WINDOW_MS = 60_000;
 export const DEFAULT_MAX_RATE_KEYS = 100_000;
 
 interface Window {
