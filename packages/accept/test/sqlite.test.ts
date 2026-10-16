@@ -124,6 +124,18 @@ describe('SqliteSingleUseStore', () => {
     assert.equal((await s.claim('new', 30)).ok, false);
   });
 
+  it('a full store refuses new claims without evicting a live one, and prune frees room', async () => {
+    const s = new SqliteSingleUseStore(openSqlite(':memory:'), { maxEntries: 2 });
+    await s.claim('a', 10);
+    await s.claim('b', 20);
+    assert.deepEqual(await s.claim('c', 30), { ok: false, code: 'STORE_FULL' });
+    assert.deepEqual(await s.claim('a', 30), { ok: false, code: 'NONCE_REPLAY' });
+    assert.equal(await s.prune(10), 1);
+    assert.equal((await s.claim('c', 30)).ok, true);
+    assert.deepEqual(await s.claim('b', 30), { ok: false, code: 'NONCE_REPLAY' });
+    assert.throws(() => new SqliteSingleUseStore(openSqlite(':memory:'), { maxEntries: 0 }), { code: 'CONFIG_INVALID' });
+  });
+
   it('refuses a non-integer expiry', async () => {
     const s = new SqliteSingleUseStore(openSqlite(':memory:'));
     await assert.rejects(s.claim('k', 1.5), { code: 'MALFORMED' });

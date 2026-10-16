@@ -1,14 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { type ClaimResult, ProtocolError, ProtocolErrorCode, type SingleUseStore } from 'agentpay-hub/protocol';
+import { type ClaimResult, DEFAULT_MAX_CLAIMS, ProtocolError, ProtocolErrorCode, type SingleUseStore } from 'agentpay-hub/protocol';
 
 /**
  * Single-use claims in SQLite: the primary key makes `claim` atomic across every process on the file.
- * An expired claim still blocks until `prune`, as in the memory store.
- * shortcut: no entry cap (the memory store has one); the disk is the bound, so rate-limit before claiming.
+ * As in the memory store, an expired claim still blocks until `prune`, and a full store refuses
+ * new claims (fail closed) rather than evicting one: dropping a live claim would reopen a replay.
  */
 export class SqliteSingleUseStore implements SingleUseStore {
-  constructor(private readonly db: DatabaseSync) {
+  private readonly maxEntries: number;
+
+  constructor(private readonly db: DatabaseSync, options: { readonly maxEntries?: number } = {}) {
+    const maxEntries = options.maxEntries ?? DEFAULT_MAX_CLAIMS;
+    if (!Number.isInteger(maxEntries) || maxEntries < 1) throw new ProtocolError(ProtocolErrorCode.CONFIG_INVALID, 'maxEntries must be a positive integer');
+    this.maxEntries = maxEntries;
     db.exec(`CREATE TABLE IF NOT EXISTS single_use_claims (
       key TEXT PRIMARY KEY,
       token TEXT NOT NULL,
@@ -20,9 +25,13 @@ export class SqliteSingleUseStore implements SingleUseStore {
   async claim(key: string, expiresAtSec: number): Promise<ClaimResult> {
     if (!Number.isInteger(expiresAtSec)) throw new ProtocolError(ProtocolErrorCode.MALFORMED, 'claim expiry must be an integer');
     const token = randomUUID();
-    const { changes } = this.db.prepare('INSERT INTO single_use_claims (key, token, expires_at) VALUES (?, ?, ?) ON CONFLICT (key) DO NOTHING')
-      .run(key, token, expiresAtSec);
-    return changes === 1 ? { ok: true, token } : { ok: false, code: ProtocolErrorCode.NONCE_REPLAY };
+    // One statement, so the cap check and the insert are atomic across processes on the file.
+    const { changes } = this.db.prepare(`INSERT INTO single_use_claims (key, token, expires_at)
+      SELECT ?, ?, ? WHERE (SELECT COUNT(*) FROM single_use_claims) < ? ON CONFLICT (key) DO NOTHING`)
+      .run(key, token, expiresAtSec, this.maxEntries);
+    if (changes === 1) return { ok: true, token };
+    const taken = this.db.prepare('SELECT 1 FROM single_use_claims WHERE key = ?').get(key) !== undefined;
+    return { ok: false, code: taken ? ProtocolErrorCode.NONCE_REPLAY : ProtocolErrorCode.STORE_FULL };
   }
 
   async release(key: string, token: string): Promise<boolean> {
