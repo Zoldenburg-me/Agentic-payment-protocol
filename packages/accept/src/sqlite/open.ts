@@ -12,6 +12,11 @@ export function openSqlite(path: string): DatabaseSync {
   if (path.trim() === '') throw new AcceptError(E.CONFIG_INVALID, 'the SQLite path is empty');
   const db = new DatabaseSync(path);
   // busy_timeout first: switching a new file to WAL takes a lock, and workers starting together would fail at once.
-  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL;`);
-  return db;
+  try {
+    db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL;`);
+    return db;
+  } catch (error) {
+    db.close(); // a startup retry loop must not pile up open handles
+    throw error;
+  }
 }
