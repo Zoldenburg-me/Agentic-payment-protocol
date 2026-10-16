@@ -330,4 +330,51 @@ describe('waitForIdleRelay', () => {
       (e: unknown) => isConfig(e) && /2 transaction\(s\) pending .*nonces 7 to 8/.test((e as Error).message),
     );
   });
+
+  const walletOf = (fail?: (nonce: number) => Error | undefined) => {
+    const sent: { to: string; value: bigint; nonce: number; gas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }[] = [];
+    return {
+      sent,
+      sendTransaction: async (tx: (typeof sent)[number]) => {
+        const error = fail?.(tx.nonce);
+        if (error) throw error;
+        sent.push(tx);
+        return `0x${'ab'.repeat(32)}` as const;
+      },
+    };
+  };
+
+  it('replaces nonces still stuck after afterMs with zero-value self-transfers at the cancel fee, once each', async () => {
+    let t = 0;
+    const wallet = walletOf();
+    const stuck = clientOf([{ pending: 9, latest: 7 }, { pending: 9, latest: 7 }, { pending: 9, latest: 7 }, { pending: 9, latest: 7 }, { pending: 9, latest: 9 }]);
+    await waitForIdleRelay(stuck, ADDRESS, {
+      timeoutMs: 20_000, pollMs: 2_000, now: () => t, sleep: async (ms) => { t += ms; },
+      cancel: { wallet, afterMs: 4_000, maxFeePerGas: 2_000_000_000n },
+    });
+    assert.deepEqual(wallet.sent.map((tx) => tx.nonce), [7, 8]);
+    for (const tx of wallet.sent) {
+      assert.deepEqual(tx, { to: ADDRESS, value: 0n, nonce: tx.nonce, gas: 21_000n, maxFeePerGas: 2_000_000_000n, maxPriorityFeePerGas: 2_000_000_000n });
+    }
+  });
+
+  it('waits before replacing, and still refuses to start when the replacements do not clear in time', async () => {
+    let t = 0;
+    const early = walletOf();
+    await waitForIdleRelay(clientOf([{ pending: 8, latest: 7 }, { pending: 8, latest: 8 }]), ADDRESS, {
+      timeoutMs: 20_000, pollMs: 2_000, now: () => t, sleep: async (ms) => { t += ms; },
+      cancel: { wallet: early, afterMs: 4_000, maxFeePerGas: 1n },
+    });
+    assert.equal(early.sent.length, 0); // cleared by itself: nothing replaced
+
+    t = 0;
+    const refusing = walletOf(() => new Error('replacement transaction underpriced'));
+    await assert.rejects(
+      waitForIdleRelay(clientOf([{ pending: 9, latest: 7 }]), ADDRESS, {
+        timeoutMs: 8_000, pollMs: 2_000, now: () => t, sleep: async (ms) => { t += ms; },
+        cancel: { wallet: refusing, afterMs: 2_000, maxFeePerGas: 1n },
+      }),
+      (e: unknown) => isConfig(e) && /could not be replaced/.test((e as Error).message) && (e as Error).cause instanceof Error,
+    );
+  });
 });

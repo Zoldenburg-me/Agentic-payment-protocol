@@ -18,6 +18,10 @@ const MAX_FEE_PER_GAS = 1_000_000_000n;
 const RECONCILE_EVERY_MS = 60_000;
 /** Base Sepolia mines every 2 s: transactions at market price clear well within this. */
 const RELAY_IDLE_TIMEOUT_MS = 120_000;
+/** Then still-pending nonces from an earlier run are replaced by zero-value self-transfers. */
+const RELAY_CANCEL_AFTER_MS = 30_000;
+/** Over the submitter's cap by more than the 10% a node needs to take a same-nonce replacement. */
+const CANCEL_FEE_PER_GAS = MAX_FEE_PER_GAS * 2n;
 
 process.umask(0o077); // the database file holds payers' addresses: not world-readable
 const env = parseEnv(process.env);
@@ -37,7 +41,10 @@ const service = hostedService({
 });
 
 try {
-  await waitForIdleRelay(client, relay.address, { timeoutMs: RELAY_IDLE_TIMEOUT_MS, pollMs: 2_000 });
+  await waitForIdleRelay(client, relay.address, {
+    timeoutMs: RELAY_IDLE_TIMEOUT_MS, pollMs: 2_000,
+    cancel: { wallet, afterMs: RELAY_CANCEL_AFTER_MS, maxFeePerGas: CANCEL_FEE_PER_GAS },
+  });
 } catch (error) {
   log(error);
   process.exit(1);
