@@ -2,13 +2,13 @@ import { AcceptError, AcceptErrorCode as E, type AcceptErrorCode } from '../erro
 import type { NewSellerPayment, SellerLedgerPort, SellerPayment, SellerPaymentStatus } from '../ports.js';
 
 /** Which settlement states each transition may start from. Nothing moves backward. */
-const FROM: Readonly<Record<Exclude<SellerPaymentStatus, 'owed'>, readonly SellerPaymentStatus[]>> = {
+export const FROM: Readonly<Record<Exclude<SellerPaymentStatus, 'owed'>, readonly SellerPaymentStatus[]>> = {
   submitted: ['owed'],
   settled: ['owed', 'submitted'],
   refused: ['owed', 'submitted'],
 };
 
-const freeze = (row: SellerPayment): SellerPayment => Object.freeze({ ...row, meta: Object.freeze({ ...row.meta }) });
+export const freeze = (row: SellerPayment): SellerPayment => Object.freeze({ ...row, meta: Object.freeze({ ...row.meta }) });
 
 /** Single-process ledger for tests and local dev. Every row handed out is a frozen snapshot. */
 export class MemorySellerLedger implements SellerLedgerPort {
