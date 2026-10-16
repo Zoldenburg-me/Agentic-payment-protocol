@@ -77,7 +77,7 @@ const wallet = createWalletClient({
 const acceptor = accept(
   { sellerAccountId: 'my-shop', payTo, chainId: 8453, asset: USDC, price: () => ({ amount: 10_000n }) },
   {
-    ledger: new MemorySellerLedger(),       // dev only: use a durable SellerLedgerPort in production
+    ledger: new MemorySellerLedger(),       // dev only: see SQLite below
     claims: new MemorySingleUseStore(),
     chain: viemChain({ client, chainId: 8453 }),
     submitter: viemSubmitter({ wallet, client, chainId: 8453, asset: USDC, payTo, maxGas: 150_000n, maxFeePerGas: 10_000_000_000n }),
@@ -91,6 +91,20 @@ setInterval(() => acceptor.reconcileOwed(), 60_000); // settle or expire payment
 
 The gas key can only call `transferWithAuthorization` on the pinned token, to the pinned payee. Funds go
 straight from the agent to `payTo`; they never pass through the server.
+
+For production, swap the in-memory stores for SQLite. One database file backs all three:
+
+```ts
+import { openSqlite, SqliteSellerLedger, SqliteSingleUseStore, SqliteRateLimiter } from '@zold/accept/sqlite';
+
+const db = openSqlite('./seller.db');
+// pass these to accept() in place of the memory stores above
+const stores = { ledger: new SqliteSellerLedger(db), claims: new SqliteSingleUseStore(db), rateLimiter: new SqliteRateLimiter(db) };
+```
+
+WAL mode lets several processes on one host share the file. Use local disk, not a network filesystem.
+Needs Node >= 22.13 (`node:sqlite`). The `reconcileOwed()` timer above also prunes expired claims; a full
+claims store refuses new payments rather than forget one.
 
 ### How a payment is handled
 
