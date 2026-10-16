@@ -5,7 +5,9 @@ import { baseSepolia } from 'viem/chains';
 import { viemChain, viemSubmitter } from '@zold/accept';
 import { openSqlite } from '@zold/accept/sqlite';
 import { parseEnv } from './env.js';
+import { errorLine } from './log.js';
 import { MerchantStore } from './merchants.js';
+import { waitForIdleRelay } from './relay.js';
 import { SETTLE_ROUTE, hostedService } from './service.js';
 
 /** Circle USDC on Base Sepolia (EIP-712 name "USDC", version "2"). Base Sepolia only: no real funds. */
@@ -14,22 +16,18 @@ const MAX_GAS = 150_000n;
 /** 1 gwei: Base Sepolia usually asks about a thousandth of that. */
 const MAX_FEE_PER_GAS = 1_000_000_000n;
 const RECONCILE_EVERY_MS = 60_000;
+/** Base Sepolia mines every 2 s: transactions at market price clear well within this. */
+const RELAY_IDLE_TIMEOUT_MS = 120_000;
 
 process.umask(0o077); // the database file holds payers' addresses: not world-readable
 const env = parseEnv(process.env);
-
-/** Code and short message only, the RPC URL (which may hold a provider key) blanked: viem puts it in its messages too. */
-const log = (error: unknown): void => {
-  const e = error as { name?: unknown; code?: unknown; shortMessage?: unknown; message?: unknown } | undefined;
-  let message = String(e?.shortMessage ?? e?.message ?? error);
-  for (const url of [env.rpcUrl, process.env.HUB_RPC_URL ?? env.rpcUrl]) message = message.replaceAll(url, '[rpc]');
-  console.error(JSON.stringify({ level: 'error', name: String(e?.name), code: e?.code, message }));
-};
+const log = (error: unknown): void => console.error(errorLine(error));
 const db = openSqlite(env.dbPath);
 const merchants = new MerchantStore(db);
 const transport = http(env.rpcUrl);
 const client = createPublicClient({ chain: baseSepolia, transport });
-const wallet = createWalletClient({ account: privateKeyToAccount(env.relayKey), chain: baseSepolia, transport });
+const relay = privateKeyToAccount(env.relayKey);
+const wallet = createWalletClient({ account: relay, chain: baseSepolia, transport });
 const service = hostedService({
   db, merchants, chainId: baseSepolia.id, asset: USDC, limits: env.limits, trustedProxyHops: env.trustedProxyHops, onError: log,
   chain: viemChain({ client, chainId: baseSepolia.id }),
@@ -38,6 +36,12 @@ const service = hostedService({
   }),
 });
 
+try {
+  await waitForIdleRelay(client, relay.address, { timeoutMs: RELAY_IDLE_TIMEOUT_MS, pollMs: 2_000 });
+} catch (error) {
+  log(error);
+  process.exit(1);
+}
 const server = createServer(service.listener);
 server.listen(env.port, env.host, () => {
   console.log(JSON.stringify({ level: 'info', message: `POST ${SETTLE_ROUTE} on ${env.host}:${env.port}, Base Sepolia` }));

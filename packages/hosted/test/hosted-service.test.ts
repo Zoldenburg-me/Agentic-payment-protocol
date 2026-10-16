@@ -10,8 +10,10 @@ import { SqliteSellerLedger, openSqlite } from '@zold/accept/sqlite';
 import { CHAIN_ID, DOMAIN, NOW_S, PRICE, USDC, payHeader, tick } from '../../accept/test/helpers.js';
 import { Counters } from '../src/counters.js';
 import { parseEnv } from '../src/env.js';
+import { errorLine, redactUrls } from '../src/log.js';
 import { MerchantStore } from '../src/merchants.js';
-import { type HostedLimits, MAX_BODY_BYTES, SETTLE_ROUTE, hostedService } from '../src/service.js';
+import { waitForIdleRelay } from '../src/relay.js';
+import { type HostedLimits, MAX_BODY_BYTES, MAX_JSON_DEPTH, SETTLE_ROUTE, hostedService, nestsDeeper } from '../src/service.js';
 
 const PAY_A = getAddress(`0x${'a1'.repeat(20)}`);
 const PAY_B = getAddress(`0x${'b2'.repeat(20)}`);
@@ -238,6 +240,32 @@ describe('hostedService: POST /api/agent-payments/settle', () => {
     assert.equal(codeOf(await b.handle(get({ 'payment-signature': await payFor(h.buyer, PAY_B, `0x${'07'.repeat(32)}`) }))), 'RATE_LIMITED');
   });
 
+  it('a retry of a payment already recorded is served past the daily caps', async () => {
+    const h = await hub({ paidPerDay: 1, paidPerDayTotal: 1 });
+    const seller = sellerOf(h.url, h.merchants.add('m1', PAY_A));
+    const header = await payFor(h.buyer, PAY_A, `0x${'08'.repeat(32)}`);
+    const first = await seller.handle(get({ 'payment-signature': header }));
+    const again = await seller.handle(get({ 'payment-signature': header }));
+    assert.ok(first.kind === 'paid' && again.kind === 'paid');
+    assert.equal(again.paid.replayed, true);
+    assert.equal(again.paid.claimKey, first.paid.claimKey);
+    const fresh = await seller.handle(get({ 'payment-signature': await payFor(h.buyer, PAY_A, `0x${'09'.repeat(32)}`) }));
+    assert.equal(codeOf(fresh), 'RATE_LIMITED', 'a new payment still counts');
+    assert.equal(codeOf(await seller.handle(get({ 'payment-signature': 'garbage' }))), 'RATE_LIMITED', 'an undecodable header is no recorded payment');
+  });
+
+  it('refuses JSON nested deeper than a settle request can be, before parsing it', async () => {
+    const h = await hub();
+    const key = h.merchants.add('m1', PAY_A);
+    const deep = `${'['.repeat(MAX_JSON_DEPTH + 1)}${']'.repeat(MAX_JSON_DEPTH + 1)}`;
+    const res = await post(h.url, { key, body: deep });
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'MALFORMED' });
+    assert.equal(nestsDeeper('{"a":"[[[[[[[[[[[[\\"]]]]"}', 2), false, 'brackets inside strings, escapes included, do not count');
+    assert.equal(nestsDeeper('{"a":{"b":{}}}', 3), false);
+    assert.equal(nestsDeeper('{"a":{"b":{"c":[]}}}', 3), true);
+  });
+
   it('reconcile walks every merchant and sweeps ended limit windows', async () => {
     const h = await hub();
     h.merchants.add('m1', PAY_A);
@@ -257,5 +285,49 @@ describe('hostedService: POST /api/agent-payments/settle', () => {
     assert.equal(res.status, 500);
     assert.deepEqual(await res.json(), { error: 'INTERNAL' });
     assert.equal(h.errors.length, 1);
+  });
+});
+
+describe('logging', () => {
+  it('cuts every URL to scheme and host, so an RPC key in a path, query or userinfo is never logged', () => {
+    const text = 'HTTP request failed. URL: https://base-sepolia.g.alchemy.com/v2/SECRETKEY?x=1 and wss://user:SECRET2@rpc.example.org:8546/ws';
+    const out = redactUrls(text);
+    assert.ok(!out.includes('SECRETKEY') && !out.includes('SECRET2'));
+    assert.match(out, /https:\/\/base-sepolia\.g\.alchemy\.com and wss:\/\/rpc\.example\.org:8546$/);
+    const line = JSON.parse(errorLine({ name: 'HttpRequestError', shortMessage: 'HTTP request failed.', message: text, cause: new Error(text) }));
+    assert.deepEqual(line, { level: 'error', name: 'HttpRequestError', message: 'HTTP request failed.' });
+    assert.ok(!errorLine(new Error(text)).includes('SECRETKEY'));
+  });
+});
+
+describe('waitForIdleRelay', () => {
+  const ADDRESS = `0x${'11'.repeat(20)}` as const;
+  const clientOf = (counts: { pending: number; latest: number }[]) => {
+    let i = 0;
+    const at = () => counts[Math.min(i, counts.length - 1)] ?? { pending: 0, latest: 0 };
+    return {
+      calls: () => i,
+      getTransactionCount: async ({ blockTag }: { blockTag: 'pending' | 'latest' }) => {
+        const c = at();
+        if (blockTag === 'latest') i += 1;
+        return blockTag === 'pending' ? c.pending : c.latest;
+      },
+    };
+  };
+
+  it('returns at once when nothing is pending, and waits while an earlier run\'s transactions clear', async () => {
+    await waitForIdleRelay(clientOf([{ pending: 5, latest: 5 }]), ADDRESS, { timeoutMs: 0, pollMs: 1 });
+    const clearing = clientOf([{ pending: 7, latest: 5 }, { pending: 7, latest: 6 }, { pending: 7, latest: 7 }]);
+    let t = 0;
+    await waitForIdleRelay(clearing, ADDRESS, { timeoutMs: 10_000, pollMs: 2_000, now: () => t, sleep: async (ms) => { t += ms; } });
+    assert.equal(clearing.calls(), 3);
+  });
+
+  it('refuses to start when nonces stay pending past the timeout, naming them', async () => {
+    let t = 0;
+    await assert.rejects(
+      waitForIdleRelay(clientOf([{ pending: 9, latest: 7 }]), ADDRESS, { timeoutMs: 4_000, pollMs: 2_000, now: () => t, sleep: async (ms) => { t += ms; } }),
+      (e: unknown) => isConfig(e) && /2 transaction\(s\) pending .*nonces 7 to 8/.test((e as Error).message),
+    );
   });
 });

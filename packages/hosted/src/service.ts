@@ -5,6 +5,7 @@ import {
   type Submitter, accept, hostedSettle, statusFor, toReqLike,
 } from '@zold/accept';
 import { SqliteRateLimiter, SqliteSellerLedger, SqliteSingleUseStore } from '@zold/accept/sqlite';
+import { decodePaymentSignature, singleUseKey } from 'agentpay-hub/protocol';
 import { Counters } from './counters.js';
 import type { Merchant, MerchantStore } from './merchants.js';
 
@@ -14,6 +15,8 @@ export const MAX_BODY_BYTES = 128 * 1024;
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
 const BEARER = /^Bearer (\S+)$/;
+/** A settle request nests three deep (body.request.headers); anything far deeper is not one. */
+export const MAX_JSON_DEPTH = 8;
 
 export interface HostedLimits {
   /** The smallest price settled, in atomic USDC: dust costs the relay more gas than it moves. */
@@ -69,6 +72,24 @@ async function readBody(req: IncomingMessage): Promise<string | undefined> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/** Whether JSON text nests deeper than `max`, counted outside strings, before it is parsed. */
+export function nestsDeeper(text: string, max: number): boolean {
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    if (inString) {
+      if (c === '\\') i += 1;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === '{' || c === '[') {
+      depth += 1;
+      if (depth > max) return true;
+    } else if (c === '}' || c === ']') depth -= 1;
+  }
+  return false;
+}
+
 /** One merchant's view of the shared ledger, so its reconcile only walks its own rows. */
 function scopedLedger(ledger: SellerLedgerPort, id: string): SellerLedgerPort {
   return {
@@ -97,12 +118,25 @@ export function hostedService(o: HostedServiceOptions) {
   const { limits } = o;
   const acceptors = new Map<string, Acceptor>();
 
+  /** Whether the header names a payment this merchant already recorded (unverified: it only skips the quota; accept still verifies). */
+  async function recorded(id: string, header: string): Promise<boolean> {
+    try {
+      const a = decodePaymentSignature(header).payload.authorization as Record<string, unknown> | undefined;
+      const key = singleUseKey({ sellerAccountId: id, chainId: o.chainId, asset: o.asset, from: String(a?.from), nonce: String(a?.nonce) });
+      return (await ledger.get(key)) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
   const limited = (id: string, inner: Acceptor): Acceptor => ({
     ...inner,
     async handle(req, options) {
       if ((options?.price?.amount ?? 0n) < limits.minAmount) return refusal(E.PRICE_ERROR);
       if (!counters.take(`minute:${id}`, limits.perMinute, MINUTE_MS, now())) return refusal(E.RATE_LIMITED);
-      const paying = req.headers['payment-signature'] !== undefined;
+      const header = req.headers['payment-signature'];
+      // A retry of a payment already in the ledger was counted once; its buyer must be able to fetch what it paid for.
+      const paying = header !== undefined && !(await recorded(id, header));
       if (paying && !counters.take(`day:${id}`, limits.paidPerDay, DAY_MS, now())) return refusal(E.RATE_LIMITED);
       // '*' is no merchant id, so this key is the relay's own
       if (paying && !counters.take('day:*', limits.paidPerDayTotal, DAY_MS, now())) return refusal(E.RATE_LIMITED);
@@ -147,6 +181,7 @@ export function hostedService(o: HostedServiceOptions) {
     }
     const text = await readBody(req);
     if (text === undefined) return send(res, 413, { error: 'TOO_LARGE' }, { connection: 'close' });
+    if (nestsDeeper(text, MAX_JSON_DEPTH)) return send(res, 400, { error: 'MALFORMED' });
     let body: unknown;
     try {
       body = JSON.parse(text);
