@@ -53,8 +53,22 @@ export function internalError(res: ServerResponse): void {
   res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'INTERNAL' }));
 }
 
+/** Defer delivery when the handler can confirm it, so only a route that succeeded marks the payment delivered. */
+export const deferIfConfirmable = (acceptor: PaymentHandler) => (acceptor.confirmDelivery ? { deferDelivery: true } : undefined);
+
+/** The route succeeded: record the delivery. A failed write is reported, never turned into an error for the payer. */
+export async function confirmDelivered(acceptor: PaymentHandler, claimKey: string): Promise<void> {
+  if (!acceptor.confirmDelivery) return;
+  try {
+    await acceptor.confirmDelivery(claimKey);
+  } catch (error) {
+    // The row stays in ledger.undelivered(): the next retry or your sweep delivers (idempotently) again.
+    acceptor.reportError(new AcceptError(E.INTERNAL, `payment ${claimKey} was delivered but recording it failed`, { cause: error }));
+  }
+}
+
 async function serve(acceptor: PaymentHandler, onPaid: OnPaid, options: NodeHandlerOptions, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const result = await acceptor.handle(toReqLike(req, options));
+  const result = await acceptor.handle(toReqLike(req, options), deferIfConfirmable(acceptor));
   if (result.kind === 'respond') {
     res.writeHead(result.status, result.headers).end(result.body);
     return;
@@ -66,10 +80,15 @@ async function serve(acceptor: PaymentHandler, onPaid: OnPaid, options: NodeHand
     // The payment is accepted; the delivery failed. The seller hears why; the payer gets a bare 500 and may retry.
     acceptor.reportError(new AcceptError(E.DELIVERY_FAILED, `payment ${result.paid.claimKey} was accepted but its delivery failed`, { cause: error }));
     internalError(res);
+    return;
   }
+  await confirmDelivered(acceptor, result.paid.claimKey);
 }
 
-/** A `node:http` request listener: answers 402s and refusals itself, calls `onPaid` once a payment is accepted. */
+/**
+ * A `node:http` request listener: answers 402s and refusals itself, calls `onPaid` once a payment is accepted.
+ * The payment is marked delivered only after `onPaid` resolves; one that throws stays undelivered.
+ */
 export function nodeHandler(acceptor: PaymentHandler, onPaid: OnPaid, options: NodeHandlerOptions = {}) {
   return (req: IncomingMessage, res: ServerResponse): void => {
     serve(acceptor, onPaid, options, req, res).catch((error: unknown) => {

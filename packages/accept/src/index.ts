@@ -3,6 +3,7 @@ export type { AcceptDeps, AcceptResult, Acceptor, HandleOptions, PaidContext, Pa
 export { parseAcceptOptions } from './config.js';
 export type { AcceptConfig, AcceptOptions, Price, PriceFn, PriceRequest } from './config.js';
 export { AcceptError, AcceptErrorCode, statusFor } from './errors.js';
+export { redactError, redactUrls } from './redact.js';
 export { ChainRevertError } from './ports.js';
 export type {
   ChainLog, ChainPort, NewSellerPayment, RateLimiter, SellerLedgerPort, SellerPayment, SellerPaymentStatus, StuckReport, Submitter,

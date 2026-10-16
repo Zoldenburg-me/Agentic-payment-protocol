@@ -10,6 +10,13 @@ export const FROM: Readonly<Record<Exclude<SellerPaymentStatus, 'owed'>, readonl
 
 export const freeze = (row: SellerPayment): SellerPayment => Object.freeze({ ...row, meta: Object.freeze({ ...row.meta }) });
 
+/** Finished rows: nothing more will happen to them, so they may be pruned. */
+const finished = (row: SellerPayment): boolean => row.status === 'refused' || (row.status === 'settled' && row.delivered);
+
+export function checkCutoff(beforeUnixS: number): void {
+  if (!Number.isSafeInteger(beforeUnixS) || beforeUnixS < 0) throw new AcceptError(E.CONFIG_INVALID, 'prune cutoff must be unix seconds');
+}
+
 /** Single-process ledger for tests and local dev. Every row handed out is a frozen snapshot. */
 export class MemorySellerLedger implements SellerLedgerPort {
   private readonly rows = new Map<string, SellerPayment>();
@@ -20,6 +27,17 @@ export class MemorySellerLedger implements SellerLedgerPort {
 
   async list(): Promise<readonly SellerPayment[]> {
     return [...this.rows.values()];
+  }
+
+  async undelivered(): Promise<readonly SellerPayment[]> {
+    return [...this.rows.values()].filter((r) => r.status === 'settled' && !r.delivered);
+  }
+
+  async prune(beforeUnixS: number): Promise<number> {
+    checkCutoff(beforeUnixS);
+    const old = [...this.rows.values()].filter((r) => finished(r) && BigInt(r.validBefore) < BigInt(beforeUnixS));
+    for (const r of old) this.rows.delete(r.claimKey);
+    return old.length;
   }
 
   async recordVerified(row: NewSellerPayment): Promise<{ created: boolean; row: SellerPayment }> {

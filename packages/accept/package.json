@@ -1,6 +1,6 @@
 {
   "name": "@zold/accept",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Accept x402 payments in any Node HTTP server: verify, claim, settle on-chain, deliver once. No facilitator.",
   "type": "module",

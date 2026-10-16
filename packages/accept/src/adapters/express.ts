@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { PaidContext, PaymentHandler } from '../accept.js';
 import { AcceptError, AcceptErrorCode as E } from '../errors.js';
-import { type NodeHandlerOptions, internalError, toReqLike } from './node-http.js';
+import { type NodeHandlerOptions, confirmDelivered, deferIfConfirmable, internalError, toReqLike } from './node-http.js';
 
 /** The parts of an Express request and response the adapter uses (Express 4 and 5). */
 export interface ExpressRequest extends IncomingMessage {
@@ -21,12 +21,13 @@ export const paymentOf = (res: ExpressResponse): PaidContext | undefined => res.
  * Express middleware: answers 402s and refusals itself, and calls `next()` once a payment is accepted,
  * with the payment on `paymentOf(res)`. Prices the original URL, so mounting under a prefix cannot
  * change what a route costs. The client IP comes from `trustedProxyHops`, never from Express's
- * `trust proxy`, so both adapters see the same client.
+ * `trust proxy`, so both adapters see the same client. The payment is marked delivered when the
+ * response finishes with a status below 400.
  */
 export function expressPayment(acceptor: PaymentHandler, options: NodeHandlerOptions = {}) {
   return (req: ExpressRequest, res: ExpressResponse, next: Next): void => {
     Promise.resolve()
-      .then(() => acceptor.handle(toReqLike(req, options, req.originalUrl ?? req.url ?? '/')))
+      .then(() => acceptor.handle(toReqLike(req, options, req.originalUrl ?? req.url ?? '/'), deferIfConfirmable(acceptor)))
       .then((result) => {
         if (result.kind === 'respond') {
           res.writeHead(result.status, result.headers).end(result.body);
@@ -34,6 +35,10 @@ export function expressPayment(acceptor: PaymentHandler, options: NodeHandlerOpt
         }
         for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
         res.locals[LOCALS_KEY] = result.paid;
+        // Delivered only once the route answered with a success: an error or an aborted response stays owed.
+        res.once('finish', () => {
+          if (res.statusCode < 400) void confirmDelivered(acceptor, result.paid.claimKey);
+        });
         next();
       })
       .catch((error: unknown) => {
