@@ -113,11 +113,15 @@ claims store refuses new payments rather than forget one.
 - **Each payment is delivered once.** Payments are claimed by authorization nonce. A retry of a payment
   that was already delivered comes back with `paid.replayed = true`: serve the same resource again,
   keyed by `paid.claimKey`, and repeat no side effects.
-- **Delivered only after your route succeeds.** `nodeHandler` marks a payment delivered once `onPaid`
-  resolves, and `expressPayment` once the response finishes below 400. A route that throws or crashes
-  leaves it in `ledger.undelivered()`; the payer's retry is handed out again. Using `handle` directly,
-  pass `{ deferDelivery: true }` and call `acceptor.confirmDelivery(paid.claimKey)` after your side
-  effect (without it, `handle` marks delivery before returning, as in 0.1).
+- **At most once by default; opt in to delivery after success.** By default a payment is marked
+  delivered before your route runs, so the route runs once unreplayed even if the payer sends one
+  header in parallel; a route that throws leaves the payer paid with nothing delivered. With
+  `nodeHandler(acceptor, onPaid, { deferDelivery: true })` (or the same option on `expressPayment`) it
+  is marked only after `onPaid` resolves (Express: the response finishes below 400). A throw, crash or
+  client abort then leaves it in `ledger.undelivered()` and a retry is handed out again; the cost is that
+  concurrent requests can all see `replayed: false`, so your side effect must be idempotent by
+  `paid.claimKey`. Using `handle` directly: `handle(req, { deferDelivery: true })`, then
+  `acceptor.confirmDelivery(paid.claimKey)` after your side effect.
 - **Settle, then deliver.** By default the route runs only after the transfer has 2 confirmations.
   `optimistic` delivery (GET/HEAD only, up to $0.50) is opt-in.
 - **Built-in limits.** Per-IP and per-payer rate limits, a cap on settlements in flight (503 BUSY
@@ -145,10 +149,11 @@ sooner but more often with 503; it never makes a payment settle faster.
   differently and fail with `NONCE_REPLAY`. `await acceptor.lookup(header)` returns the stored row for
   that exact header; pass `{ amount: BigInt(row.amount), meta: row.meta }` as `handle`'s `price`.
 - **Deliver what was paid but not delivered.** `ledger.undelivered()` (memory and SQLite) lists settled
-  payments whose delivery never succeeded. Deliver each (idempotently, by `claimKey`), then
+  payments not marked delivered (with `deferDelivery`: whose delivery never succeeded). Deliver each (idempotently, by `claimKey`), then
   `ledger.markDelivered(claimKey)`. Run it after `reconcileOwed()`.
 - **Prune old rows.** `ledger.prune(beforeUnixS)` deletes refused and delivered rows whose authorization
-  expired before the cutoff, e.g. `ledger.prune(now - 90 * 86_400)`. Open and undelivered rows are kept.
+  expired before the cutoff, in unix seconds and not after now, e.g.
+  `ledger.prune(Math.floor(Date.now() / 1000) - 90 * 86_400)`. Open and undelivered rows are kept.
   A retry of a pruned payment gets `NONCE_REPLAY` instead of a replay.
 
 ## The buyer side: `agentpay-hub`

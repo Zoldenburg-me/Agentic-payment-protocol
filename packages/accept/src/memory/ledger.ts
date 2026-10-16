@@ -13,8 +13,11 @@ export const freeze = (row: SellerPayment): SellerPayment => Object.freeze({ ...
 /** Finished rows: nothing more will happen to them, so they may be pruned. */
 const finished = (row: SellerPayment): boolean => row.status === 'refused' || (row.status === 'settled' && row.delivered);
 
+/** A cutoff after now (or in milliseconds) would delete rows whose authorization a retry can still use. */
 export function checkCutoff(beforeUnixS: number): void {
-  if (!Number.isSafeInteger(beforeUnixS) || beforeUnixS < 0) throw new AcceptError(E.CONFIG_INVALID, 'prune cutoff must be unix seconds');
+  if (!Number.isSafeInteger(beforeUnixS) || beforeUnixS < 0 || beforeUnixS > Math.floor(Date.now() / 1000)) {
+    throw new AcceptError(E.CONFIG_INVALID, 'prune cutoff must be unix seconds, not after now');
+  }
 }
 
 /** Single-process ledger for tests and local dev. Every row handed out is a frozen snapshot. */

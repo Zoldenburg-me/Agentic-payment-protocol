@@ -56,13 +56,27 @@ describe('deferred delivery', () => {
     if (r.kind === 'paid') assert.equal((await s.ledger.get(r.paid.claimKey))?.delivered, true);
   });
 
-  it('nodeHandler marks delivery only after onPaid succeeds', async () => {
+  it('adapters keep 0.1 at-most-once by default: parallel requests with one header run the route once unreplayed', async () => {
+    const s = setup();
+    const replayed: boolean[] = [];
+    const url = await listen(nodeHandler(s.acceptor, async (_req, res, paid) => {
+      replayed.push(paid.replayed);
+      await tick();
+      res.end('ok');
+    }));
+    const header = await payHeader(s.buyer);
+    await Promise.all(Array.from({ length: 5 }, () => fetch(`${url}/rates`, { headers: { 'payment-signature': header } })));
+    assert.equal(replayed.filter((r) => !r).length, 1);
+    assert.equal(s.chain.submissions.length, 1);
+  });
+
+  it('nodeHandler with deferDelivery marks delivery only after onPaid succeeds', async () => {
     const s = setup();
     let fail = true;
     const url = await listen(nodeHandler(s.acceptor, (_req, res) => {
       if (fail) throw new Error('seller write failed');
       res.end('ok');
-    }));
+    }, { deferDelivery: true }));
     const header = await payHeader(s.buyer);
     const first = await fetch(`${url}/rates`, { headers: { 'payment-signature': header } });
     assert.equal(first.status, 500);
@@ -78,7 +92,7 @@ describe('deferred delivery', () => {
     assert.equal(s.chain.submissions.length, 1, 'the retry did not pay again');
   });
 
-  it('expressPayment marks delivery only once the route answered below 400', async () => {
+  it('expressPayment with deferDelivery marks delivery only once the route answered below 400', async () => {
     const s = setup();
     let status = 500;
     const url = await listen((rawReq, rawRes) => {
@@ -86,7 +100,7 @@ describe('deferred delivery', () => {
       const res = rawRes as ExpressResponse;
       req.originalUrl = req.url ?? '/';
       res.locals = {};
-      expressPayment(s.acceptor)(req, res, () => res.writeHead(status).end());
+      expressPayment(s.acceptor, { deferDelivery: true })(req, res, () => res.writeHead(status).end());
     });
     const header = await payHeader(s.buyer);
     assert.equal((await fetch(`${url}/rates`, { headers: { 'payment-signature': header } })).status, 500);
@@ -149,6 +163,29 @@ describe('onError redaction', () => {
     assert.deepEqual(got.metaMessages, ['URL: https://rpc.example']);
   });
 
+  it('recurses into plain objects, drops headers/body/request, survives cycles and thrown non-errors', () => {
+    const s = setup();
+    const viemLike = Object.assign(new Error('HTTP request failed'), {
+      headers: { Authorization: 'Bearer SECRETTOKEN' },
+      body: { method: 'eth_sendRawTransaction' },
+      request: { url: 'https://rpc.example/key' },
+      meta: { endpoint: { url: 'https://rpc.example/v3/SECRETKEY' } },
+    });
+    (viemLike as unknown as { self: unknown }).self = viemLike;
+    s.acceptor.reportError(new AcceptError(E.RPC_UNAVAILABLE, 'rpc down', { cause: viemLike }));
+    const cause = (s.errors[0] as AcceptError).cause as Record<string, unknown>;
+    assert.doesNotMatch(JSON.stringify(cause), /SECRET/);
+    assert.equal(cause.headers, undefined);
+    assert.equal(cause.body, undefined);
+    assert.equal(cause.request, undefined);
+    assert.deepEqual(cause.meta, { endpoint: { url: 'https://rpc.example' } });
+    assert.equal(cause.self, '[circular]');
+
+    s.acceptor.reportError({ message: 'thrown object at https://rpc.example/key', headers: { authorization: 'x' } });
+    s.acceptor.reportError('thrown string https://rpc.example/key');
+    assert.deepEqual(s.errors.slice(1), [{ message: 'thrown object at https://rpc.example' }, 'thrown string https://rpc.example']);
+  });
+
   it('redactUrls is exported for sellers logging their own errors', () => {
     assert.equal(redactUrls('see wss://node.example:8546/abc/def and http://x.test/?k=1'), 'see wss://node.example:8546 and http://x.test');
   });
@@ -191,5 +228,14 @@ for (const [name, make] of LEDGERS) describe(`${name} undelivered and prune`, ()
     assert.deepEqual((await l.list()).map((x) => x.claimKey).sort(), ['fresh', 'owed', 'owing']);
     assert.equal(await l.prune(200), 0);
     assert.equal(await l.prune(400), 1, 'fresh goes once the cutoff passes it');
+  });
+
+  it('refuses a cutoff in the future or in milliseconds', async () => {
+    const l = make();
+    await seed(l);
+    await assert.rejects(l.prune(Date.now()), { code: E.CONFIG_INVALID });
+    await assert.rejects(l.prune(Math.floor(Date.now() / 1000) + 60), { code: E.CONFIG_INVALID });
+    await assert.rejects(l.prune(-1), { code: E.CONFIG_INVALID });
+    assert.equal((await l.list()).length, 5, 'nothing deleted');
   });
 });

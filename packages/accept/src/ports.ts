@@ -129,7 +129,7 @@ export interface SellerLedgerPort {
   undelivered?(): Promise<readonly SellerPayment[]>;
   /**
    * Optional: deletes finished rows (refused, or settled and delivered) whose validBefore is before
-   * `beforeUnixS`; returns how many. Open and settled-undelivered rows are kept. A pruned payment's
+   * `beforeUnixS` (unix seconds, not after now); returns how many. Open and settled-undelivered rows are kept. A pruned payment's
    * retry gets NONCE_REPLAY (or EXPIRED) instead of a replay, so keep rows as long as retries matter.
    */
   prune?(beforeUnixS: number): Promise<number>;
