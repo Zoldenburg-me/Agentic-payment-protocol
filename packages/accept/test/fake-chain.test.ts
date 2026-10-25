@@ -77,6 +77,23 @@ describe('FakeFiatToken', () => {
     assert.equal(chain.balanceOfSync(PAY_TO), 100n);
   });
 
+  it('numbers logs across the block, so transfers mined together have distinct log indexes; a revert adds none', async () => {
+    const chain = new FakeFiatToken({ chainId: CHAIN_ID, asset: USDC, domain: DOMAIN, nowSec: () => NOW_S, autoMine: false });
+    const payers = [await signed(), await signed(), await signed()];
+    for (const p of payers) chain.mint(p.account.address, 100n);
+    const a = await chain.submit(payers[0]!.call);
+    chain.revertNextSubmitOnChain = 'plain';
+    const reverted = await chain.submit(payers[1]!.call);
+    const b = await chain.submit(payers[2]!.call);
+    chain.mine(1);
+    const [ra, rr, rb] = [await chain.getReceipt(a), await chain.getReceipt(reverted), await chain.getReceipt(b)];
+    assert.equal(ra?.blockNumber, rb?.blockNumber, 'one block');
+    assert.equal(rr?.blockNumber, ra?.blockNumber);
+    assert.deepEqual(ra?.logs.map((l) => [l.event, l.logIndex]), [['AuthorizationUsed', 0], ['Transfer', 1]]);
+    assert.deepEqual(rr?.logs, []);
+    assert.deepEqual(rb?.logs.map((l) => [l.event, l.logIndex]), [['AuthorizationUsed', 2], ['Transfer', 3]]);
+  });
+
   it('finds the transaction that used an authorization', async () => {
     const chain = fake();
     const { account, call } = await signed();

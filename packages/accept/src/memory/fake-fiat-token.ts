@@ -255,10 +255,15 @@ export class FakeFiatToken implements ChainPort, Submitter {
   private mineBlock(txs: readonly Tx[]): void {
     this.head += 1n;
     const number = this.head;
-    this.blocks.push({ number, txs: txs.map((tx) => ({ tx, success: this.apply(tx, number) })) });
+    let logIndex = 0; // a block numbers its logs across all of its transactions, as a real chain does
+    this.blocks.push({ number, txs: txs.map((tx) => {
+      const receipt = this.apply(tx, number, logIndex);
+      logIndex += receipt.logs.length;
+      return { tx, success: receipt.status === 'success' };
+    }) });
   }
 
-  private apply(tx: Tx, blockNumber: bigint): boolean {
+  private apply(tx: Tx, blockNumber: bigint, firstLogIndex: number): TxReceipt {
     let success = !tx.forceRevert;
     if (success) {
       try {
@@ -273,9 +278,10 @@ export class FakeFiatToken implements ChainPort, Submitter {
       this.balances.set(a.to.toLowerCase(), this.balanceOfSync(a.to) + a.value);
       this.used.set(key(a.from, a.nonce), tx.hash);
     }
-    const logs: ChainLog[] = success ? this.logsFor(a).map((l, i) => ({ ...l, logIndex: i })) : [];
-    this.receipts.set(tx.hash, { txHash: tx.hash, status: success ? 'success' : 'reverted', blockNumber, logs });
-    return success;
+    const logs: ChainLog[] = success ? this.logsFor(a).map((l, i) => ({ ...l, logIndex: firstLogIndex + i })) : [];
+    const receipt: TxReceipt = { txHash: tx.hash, status: success ? 'success' : 'reverted', blockNumber, logs };
+    this.receipts.set(tx.hash, receipt);
+    return receipt;
   }
 
   private logsFor(a: TransferCall['authorization']): Omit<ChainLog, 'logIndex'>[] {
