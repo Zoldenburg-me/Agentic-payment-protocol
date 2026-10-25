@@ -211,5 +211,15 @@ export function hostedService(o: HostedServiceOptions) {
       }
       counters.sweep(now());
     },
+    /**
+     * Deletes finished payments once their retention ends: § 147 AO keeps a record to the end of its
+     * calendar year plus `years`. A day of margin so a record dated 1 January in Berlin (UTC+1) is
+     * never taken for the year before; validBefore is at or after when the record was made.
+     */
+    async prune(years: number): Promise<number> {
+      const startOfYear = Date.UTC(new Date(now()).getUTCFullYear() - years, 0, 1) / 1000;
+      // shortcut: a full-table scan on json_extract(validBefore); index a valid_before column before the table reaches millions of rows.
+      return ledger.prune(startOfYear - DAY_MS / 1000);
+    },
   };
 }

@@ -9,6 +9,8 @@ export interface HubEnv {
   readonly host: string;
   readonly port: number;
   readonly trustedProxyHops: number;
+  /** Years payment records are kept after the end of their calendar year: at least the 10 of § 147 AO, since deletion is final. */
+  readonly retentionYears: number;
   readonly limits: HostedLimits;
 }
 
@@ -59,6 +61,7 @@ export function parseEnv(env: NodeJS.ProcessEnv): HubEnv {
     port: int(env, 'HUB_PORT', 8787, 1, 65_535),
     // Required: 0 behind a proxy puts every seller on the proxy's IP, so one bad key locks them all out.
     trustedProxyHops: int(env, 'HUB_TRUSTED_PROXY_HOPS', undefined, 0, 10),
+    retentionYears: int(env, 'HUB_RETENTION_YEARS', 10, 10, 100),
     limits: {
       minAmount: BigInt(minAmount),
       perMinute: int(env, 'HUB_PER_MINUTE', 600, 1, 1_000_000),

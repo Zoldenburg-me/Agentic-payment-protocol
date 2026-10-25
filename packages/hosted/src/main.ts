@@ -16,6 +16,7 @@ const MAX_GAS = 150_000n;
 /** 1 gwei: Base Sepolia usually asks about a thousandth of that. */
 const MAX_FEE_PER_GAS = 1_000_000_000n;
 const RECONCILE_EVERY_MS = 60_000;
+const PRUNE_EVERY_MS = 86_400_000;
 /** Base Sepolia mines every 2 s: transactions at market price clear well within this. */
 const RELAY_IDLE_TIMEOUT_MS = 120_000;
 /** Then still-pending nonces from an earlier run are replaced by zero-value self-transfers. */
@@ -61,8 +62,17 @@ const timer = setInterval(() => {
   service.reconcile().catch(log).finally(() => { reconciling = false; });
 }, RECONCILE_EVERY_MS);
 
+const prune = (): void => {
+  service.prune(env.retentionYears).then((n) => {
+    if (n > 0) console.log(JSON.stringify({ level: 'info', message: `pruned ${n} finished payments past their year-end + ${env.retentionYears} years (§ 147 AO)` }));
+  }).catch(log);
+};
+prune();
+const pruneTimer = setInterval(prune, PRUNE_EVERY_MS);
+
 process.on('SIGTERM', () => {
   clearInterval(timer);
+  clearInterval(pruneTimer);
   server.close(() => {
     db.close();
     process.exit(0);

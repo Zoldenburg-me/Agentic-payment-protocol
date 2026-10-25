@@ -29,6 +29,7 @@ Put it behind TLS on the hub's domain. The seller sets `zoldSeller({ apiUrl: 'ht
 | `HUB_PAID_PER_DAY` | `2000` | calls carrying a payment per seller key per 24 h |
 | `HUB_PAID_PER_DAY_TOTAL` | `20000` | the same over all keys: caps the relay's gas |
 | `HUB_FAILED_KEYS_PER_MINUTE` | `20` | bad keys per IP per minute before that IP is refused |
+| `HUB_RETENTION_YEARS` | `10` (minimum) | finished payments are deleted after the end of their calendar year plus this many years (§ 147 AO), at startup and daily |
 
 Merchants: `cli.js add | rotate | revoke | list`. Run it on the host, against the same `HUB_DB_PATH`.
 
@@ -36,6 +37,6 @@ Merchants: `cli.js add | rotate | revoke | list`. Run it on the host, against th
 
 - Signup with a passkey and a hub-made Safe: today the operator enters the payee address.
 - Key self-service with passkey step-up, and an audit trail.
-- `listOpen()` and retention pruning.
+- `listOpen()`.
 - A dashboard and withdrawals.
 - One host only: SQLite.
