@@ -132,6 +132,8 @@ describe('parseEnv', () => {
     assert.equal(parseEnv({ ...base, HUB_TRUSTED_PROXY_HOPS: '1' }).trustedProxyHops, 1);
     assert.equal(parseEnv({ ...base, HUB_RPC_URL: 'http://localhost:8545' }).rpcUrl, 'http://localhost:8545/');
     assert.equal(parseEnv({ ...base, HUB_MIN_AMOUNT: '5000', HUB_PORT: '9000' }).limits.minAmount, 5_000n);
+    assert.equal(env.retentionYears, 10);
+    assert.equal(parseEnv({ ...base, HUB_RETENTION_YEARS: '11' }).retentionYears, 11);
   });
 
   it('fails closed on a missing or bad variable, naming it and never its value', () => {
@@ -145,6 +147,7 @@ describe('parseEnv', () => {
     refused({ ...base, HUB_PORT: '70000' }, 'HUB_PORT');
     refused({ ...base, HUB_PER_MINUTE: '1.5' }, 'HUB_PER_MINUTE');
     refused({ ...base, HUB_MIN_AMOUNT: '0' }, 'HUB_MIN_AMOUNT');
+    refused({ ...base, HUB_RETENTION_YEARS: '9' }, 'HUB_RETENTION_YEARS');
   });
 });
 
@@ -275,6 +278,31 @@ describe('hostedService: POST /api/agent-payments/settle', () => {
     await h.service.reconcile();
     assert.equal((h.db.prepare('SELECT COUNT(*) AS n FROM hosted_counters').get() as { n: number }).n, 0);
     assert.deepEqual(h.errors, []);
+  });
+
+  it('prune keeps a payment to the end of its year plus the retention years, then deletes it', async () => {
+    const h = await hub();
+    const ledger = new SqliteSellerLedger(h.db);
+    const record = async (claimKey: string, validBefore: Date) => {
+      await ledger.recordVerified({
+        claimKey, sellerAccountId: 'm1', protocol: 'x402', chainId: CHAIN_ID, asset: USDC, payer: PAY_B, nonce: claimKey, amount: '1000',
+        payTo: PAY_A, validBefore: String(validBefore.getTime() / 1000), method: 'GET', path: '/', queryDigest: '', headerDigest: '', meta: {},
+      });
+      await ledger.recordRefused(claimKey, 'EXPIRED');
+    };
+    await record('mid-2025', new Date('2025-06-30T12:00:00Z'));
+    await record('last-before-cutoff', new Date('2025-12-30T23:59:59Z'));
+    await record('at-cutoff', new Date('2025-12-31T00:00:00Z')); // the one-day margin keeps it a year longer
+    await record('new-year-berlin', new Date('2025-12-31T23:30:00Z')); // 00:30 on 1 January 2026 in Berlin
+    let t = NOW_S * 1000;
+    const at = (iso: string) => {
+      h.advance(Date.parse(iso) - t);
+      t = Date.parse(iso);
+      return h.service.prune(10);
+    };
+    assert.equal(await at('2035-12-31T23:59:59Z'), 0, 'kept through the tenth year after 2025');
+    assert.equal(await at('2036-01-01T00:00:00Z'), 2, 'the 2025 records go once 2035 ends');
+    assert.deepEqual((await ledger.list()).map((r) => r.claimKey), ['at-cutoff', 'new-year-berlin']);
   });
 
   it('a store failure is a 500 for the seller and reaches onError', async () => {

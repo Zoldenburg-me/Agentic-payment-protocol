@@ -29,13 +29,43 @@ Put it behind TLS on the hub's domain. The seller sets `zoldSeller({ apiUrl: 'ht
 | `HUB_PAID_PER_DAY` | `2000` | calls carrying a payment per seller key per 24 h |
 | `HUB_PAID_PER_DAY_TOTAL` | `20000` | the same over all keys: caps the relay's gas |
 | `HUB_FAILED_KEYS_PER_MINUTE` | `20` | bad keys per IP per minute before that IP is refused |
+| `HUB_RETENTION_YEARS` | `10` (minimum) | finished payments are deleted after the end of their calendar year plus this many years (§ 147 AO), at startup and daily |
 
 Merchants: `cli.js add | rotate | revoke | list`. Run it on the host, against the same `HUB_DB_PATH`.
+
+## Backups
+
+The database holds payers' addresses and must outlive the host, so snapshot it nightly and copy it off the machine encrypted:
+
+```sh
+umask 077                                                    # the snapshot holds payers' addresses
+f=/backups/hub-$(date +%Y%m%d).db
+sqlite3 -cmd '.timeout 5000' "$HUB_DB_PATH" ".backup $f" &&  # consistent while the hub runs
+packages/hosted/scripts/offsite-backup.sh "$f" >> /backups/backup.log 2>&1 &&
+find /backups -name 'hub-*.db' -mtime +14 -delete            # only after an upload: local copies keep pruned rows too
+```
+
+The script encrypts with [age](https://age-encryption.org) to `AGE_RECIPIENT` and uploads with `curl --aws-sigv4`. Give it a token that can only write the one bucket, and keep the age private key off the host (a password manager). Let the bucket expire old objects, since a backup keeps rows the hub has pruned; a bucket lock keeps a compromised host from deleting recent ones.
+
+Restore, on a machine that holds the private key. Make a short-lived token that can only read the bucket; `read -rs` (bash, zsh) keeps its secret out of shell history:
+
+```sh
+cf r2 objects list --bucket-name <bucket> --cf-r2-jurisdiction eu       # names the objects; or download one in the dashboard
+umask 077                                                    # hub.db is plaintext
+read -r id; read -rs secret
+printf 'user = "%s:%s"\n' "$id" "$secret" | curl -fsS -K - --aws-sigv4 aws:amz:auto:s3 -o hub.db.age \
+  "https://<account id>.eu.r2.cloudflarestorage.com/<bucket>/hub-YYYYMMDD-HHMMSS.db.age" &&
+age -d -i <key file> -o hub.db hub.db.age &&
+[ -s hub.db ] && [ "$(sqlite3 hub.db 'PRAGMA integrity_check')" = ok ] &&
+sqlite3 hub.db 'SELECT COUNT(*) FROM seller_payments; SELECT COUNT(*) FROM merchants'
+```
+
+The counts you expect, else stop. Stop the hub, delete `$HUB_DB_PATH-wal` and `$HUB_DB_PATH-shm` (the ledger runs in WAL mode; a stale log would be applied to the restored file), put `hub.db` at `HUB_DB_PATH` (mode 0600, the hub's user), start it. Whatever the hub recorded after the snapshot is gone from the ledger; the transfers themselves are still on chain. Do one restore with the real key after setting this up: a wrong recipient makes every backup unreadable.
 
 ## Not yet (merchant-safes plan)
 
 - Signup with a passkey and a hub-made Safe: today the operator enters the payee address.
 - Key self-service with passkey step-up, and an audit trail.
-- `listOpen()` and retention pruning.
+- `listOpen()`.
 - A dashboard and withdrawals.
 - One host only: SQLite.
