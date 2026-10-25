@@ -32,7 +32,7 @@ for (const [name, make] of LEDGERS) describe(name, () => {
     const l = make();
     await l.recordVerified(row());
     assert.equal((await l.recordSubmitted('k1', TX)).status, 'submitted');
-    assert.equal((await l.recordSettled('k1', TX)).status, 'settled');
+    assert.equal((await l.recordSettled('k1', TX, 0)).status, 'settled');
     await assert.rejects(l.recordSubmitted('k1', TX), { code: E.LEDGER_TRANSITION });
     await assert.rejects(l.recordRefused('k1', E.SUBMIT_FAILED), { code: E.LEDGER_TRANSITION });
   });
@@ -40,19 +40,19 @@ for (const [name, make] of LEDGERS) describe(name, () => {
   it('allows settling straight from owed (front-run) and refusing from owed or submitted', async () => {
     const l = make();
     await l.recordVerified(row('a'));
-    assert.equal((await l.recordSettled('a', TX)).status, 'settled');
+    assert.equal((await l.recordSettled('a', TX, 0)).status, 'settled');
     await l.recordVerified(row('b'));
     await l.recordSubmitted('b', TX);
     const refused = await l.recordRefused('b', E.SETTLEMENT_TIMEOUT);
     assert.equal(refused.status, 'refused');
     assert.equal(refused.refusal, E.SETTLEMENT_TIMEOUT);
-    await assert.rejects(l.recordSettled('b', TX), { code: E.LEDGER_TRANSITION });
+    await assert.rejects(l.recordSettled('b', TX, 0), { code: E.LEDGER_TRANSITION });
   });
 
   it('marks delivery exactly once', async () => {
     const l = make();
     await l.recordVerified(row());
-    await l.recordSettled('k1', TX);
+    await l.recordSettled('k1', TX, 0);
     assert.equal((await l.markDelivered('k1')).first, true);
     assert.equal((await l.markDelivered('k1')).first, false);
   });

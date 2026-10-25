@@ -37,7 +37,8 @@ export interface Expected {
 
 export type Precheck = { readonly ok: true; readonly existing?: Hex } | SettleFailure;
 export type Submitted = { readonly ok: true; readonly txHash: Hex; readonly ours: boolean } | SettleFailure;
-export type Settled = { readonly ok: true; readonly txHash: Hex } | SettleFailure;
+/** `logIndex` is the payment's one Transfer log in `txHash`. */
+export type Settled = { readonly ok: true; readonly txHash: Hex; readonly logIndex: number } | SettleFailure;
 
 const failure = (code: AcceptErrorCode, release: boolean, final = true, status = statusFor(code)): SettleFailure =>
   ({ ok: false, code, status, release, final });
@@ -133,13 +134,13 @@ async function waitForReceipt(env: SettleEnv, txHash: Hex): Promise<{ receipt?: 
  * The AuthorizationUsed for this nonce and exactly one Transfer of `value` from the payer to payTo, both
  * from the asset. Other transfers in the same transaction (e.g. a bundling front-runner's) are ignored.
  */
-function measured(receipt: TxReceipt, e: Expected): boolean {
+function measured(receipt: TxReceipt, e: Expected): number | undefined {
   const same = (x: unknown, y: string) => typeof x === 'string' && x.toLowerCase() === y.toLowerCase();
   const fromAsset = receipt.logs.filter((l) => same(l.address, e.asset));
   const payments = fromAsset.filter((l) =>
     l.event === 'Transfer' && same(l.args.from, e.from) && same(l.args.to, e.to) && l.args.value === e.value);
   const used = fromAsset.some((l) => l.event === 'AuthorizationUsed' && same(l.args.authorizer, e.from) && same(l.args.nonce, e.nonce));
-  return used && payments.length === 1;
+  return used && payments.length === 1 ? payments[0]?.logIndex : undefined;
 }
 
 /**
@@ -162,7 +163,8 @@ export async function confirm(env: SettleEnv, e: Expected, txHash: Hex, followed
     return withCause(failure(E.SETTLEMENT_TIMEOUT, false, false), lastError);
   }
   if (receipt.status === 'success') {
-    return measured(receipt, e) ? { ok: true, txHash } : { ...failure(E.TRANSFER_MISMATCH, false), txHash };
+    const logIndex = measured(receipt, e);
+    return logIndex !== undefined ? { ok: true, txHash, logIndex } : { ...failure(E.TRANSFER_MISMATCH, false), txHash };
   }
   let use: { used: boolean; txHash: Hex | undefined };
   try {

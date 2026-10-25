@@ -33,6 +33,28 @@ Put it behind TLS on the hub's domain. The seller sets `zoldSeller({ apiUrl: 'ht
 
 Merchants: `cli.js add | rotate | revoke | list`. Run it on the host, against the same `HUB_DB_PATH`.
 
+## Settled payments
+
+`GET /api/agent-payments/settled?since=<seq>&limit=<n>` with the merchant's `Authorization: Bearer zsk_…` lists that
+merchant's settled payments with `seq > since` (default 0), in the order they settled, `limit` 1–500 (default 100). It only reads.
+
+```json
+{ "payments": [{ "seq": 7, "claim_key": "…", "txHash": "0x…", "logIndex": 1, "amount": "1000", "chainId": 84532,
+  "asset": "0x036C…CF7e", "payTo": "0xMerchant…", "payer": "0xBuyer…" }], "next_since": 7 }
+```
+
+- `seq` is the ledger's `settled_seq`, numbered when a payment settles, so a payment that settles after a later one is still
+  listed past your cursor. Pass `next_since` as the next `since`; an empty page returns `since` unchanged.
+- `logIndex` is the payment's USDC `Transfer` log in `txHash`, read from the receipt at settlement; `(txHash, logIndex)`
+  names one transfer. Payments settled before it was stored have `null`.
+- `amount` is atomic USDC as a string. Owed, submitted and refused payments are not listed. The ledger stores no settlement
+  time: take it from the transaction's block.
+- A key only ever reads its own merchant's rows: an optional `merchant=<payTo>` that is not the key's payee is 403. A bad key
+  is 401 and counts toward the per-IP lockout; reads per key are limited to `HUB_PER_MINUTE`, apart from settle calls.
+
+On the first start after this change the hub adds `settled_seq` to an existing database and numbers the already-settled
+payments in `seq` order, in one transaction; a restart never renumbers them.
+
 ## Backups
 
 The database holds payers' addresses and must outlive the host, so snapshot it nightly and copy it off the machine encrypted:

@@ -28,6 +28,39 @@ describe('openSqlite', () => {
 });
 
 describe('SqliteSellerLedger: durable and shared', () => {
+  it('numbers settled rows in a file made before settled_seq, in seq order, once; later settles continue the count', async () => {
+    const path = file();
+    const old = openSqlite(path);
+    old.exec(`CREATE TABLE seller_payments (seq INTEGER PRIMARY KEY AUTOINCREMENT, claim_key TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL, delivered INTEGER NOT NULL, row TEXT NOT NULL)`);
+    const insert = old.prepare('INSERT INTO seller_payments (claim_key, status, delivered, row) VALUES (?, ?, 0, ?)');
+    for (const [key, status] of [['s1', 'settled'], ['o1', 'owed'], ['s2', 'settled'], ['r1', 'refused'], ['s3', 'settled']]) {
+      insert.run(key ?? '', status ?? '', JSON.stringify({ ...row(key), txHash: TX }));
+    }
+    old.close();
+    const numbers = (db: ReturnType<typeof openSqlite>) =>
+      db.prepare('SELECT claim_key, settled_seq FROM seller_payments ORDER BY seq').all().map((r) => `${r.claim_key}:${r.settled_seq}`);
+    const a = openSqlite(path);
+    const ledger = new SqliteSellerLedger(a);
+    assert.deepEqual(numbers(a), ['s1:1', 'o1:null', 's2:2', 'r1:null', 's3:3']);
+    new SqliteSellerLedger(openSqlite(path)); // a restart: nothing renumbered
+    assert.deepEqual(numbers(a), ['s1:1', 'o1:null', 's2:2', 'r1:null', 's3:3']);
+    await ledger.recordSettled('o1', TX, 1);
+    assert.deepEqual(ledger.settledSince('seller-1', 0, 10).map((r) => [r.claimKey, r.settledSeq]), [['s1', 1], ['s2', 2], ['s3', 3], ['o1', 4]]);
+    assert.equal(ledger.settledSince('seller-1', 3, 10)[0]?.logIndex, 1);
+    assert.deepEqual(ledger.settledSince('other', 0, 10), []);
+  });
+
+  it('two processes settling at once never share or skip a settled_seq', async () => {
+    const path = file();
+    const a = new SqliteSellerLedger(openSqlite(path));
+    const b = new SqliteSellerLedger(openSqlite(path));
+    const keys = Array.from({ length: 10 }, (_, i) => `k${i}`);
+    for (const k of keys) await a.recordVerified(row(k));
+    await Promise.all(keys.map((k, i) => (i % 2 === 0 ? a : b).recordSettled(k, TX, i)));
+    assert.deepEqual(a.settledSince('seller-1', 0, 100).map((r) => r.settledSeq), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+
   it('keeps every field across a restart', async () => {
     const path = file();
     const first = openSqlite(path);

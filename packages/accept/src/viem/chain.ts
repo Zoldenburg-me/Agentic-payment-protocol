@@ -86,7 +86,7 @@ export function viemChain(options: ViemChainOptions): ChainPort {
         throw error;
       }
       const logs: ChainLog[] = parseEventLogs({ abi: TOKEN_EVENTS, logs: r.logs, strict: true })
-        .map((l) => ({ address: l.address, event: l.eventName, args: l.args as Readonly<Record<string, string | bigint>> }));
+        .map((l) => ({ address: l.address, event: l.eventName, logIndex: l.logIndex, args: l.args as Readonly<Record<string, string | bigint>> }));
       return { txHash: r.transactionHash, status: r.status, blockNumber: r.blockNumber, logs };
     }),
 

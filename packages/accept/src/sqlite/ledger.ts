@@ -23,9 +23,27 @@ export class SqliteSellerLedger implements SellerLedgerPort {
       claim_key TEXT NOT NULL UNIQUE,
       status TEXT NOT NULL,
       delivered INTEGER NOT NULL,
-      row TEXT NOT NULL
+      row TEXT NOT NULL,
+      settled_seq INTEGER
     );
     CREATE INDEX IF NOT EXISTS seller_payments_status ON seller_payments (status, delivered)`);
+    // A file made before settled_seq existed gets the column, then its settled rows numbered in seq order. One
+    // transaction: workers starting together migrate once, and a restart mid-way neither skips nor renumbers a row.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!(db.prepare('PRAGMA table_info(seller_payments)').all() as { name: string }[]).some((c) => c.name === 'settled_seq')) {
+        db.exec('ALTER TABLE seller_payments ADD COLUMN settled_seq INTEGER');
+      }
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS seller_payments_settled_seq ON seller_payments (settled_seq);
+        UPDATE seller_payments SET settled_seq = b.n FROM (
+          SELECT seq, (SELECT COALESCE(MAX(settled_seq), 0) FROM seller_payments) + ROW_NUMBER() OVER (ORDER BY seq) AS n
+          FROM seller_payments WHERE status = 'settled' AND settled_seq IS NULL
+        ) AS b WHERE seller_payments.seq = b.seq`);
+      db.exec('COMMIT');
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK'); // never leave the handle inside a half-done migration
+      throw error;
+    }
   }
 
   async get(claimKey: string): Promise<SellerPayment | undefined> {
@@ -41,6 +59,20 @@ export class SqliteSellerLedger implements SellerLedgerPort {
   async undelivered(): Promise<readonly SellerPayment[]> {
     return this.db.prepare("SELECT status, delivered, row FROM seller_payments WHERE status = 'settled' AND delivered = 0 ORDER BY seq").all()
       .map((s) => read(s as unknown as Stored));
+  }
+
+  /**
+   * One seller's settled rows after `since`, in the order they settled, each with its `settledSeq` as a
+   * paging cursor. Numbered when the row settles (in commit order), so a payment that settles late is
+   * never behind a cursor that already passed it.
+   */
+  settledSince(sellerAccountId: string, since: number, limit: number): readonly (SellerPayment & { readonly settledSeq: number })[] {
+    // shortcut: walks settled_seq > since and filters the seller in JSON; add a seller column and index when one hub serves many busy merchants.
+    return (this.db.prepare(
+      `SELECT settled_seq, status, delivered, row FROM seller_payments WHERE settled_seq > ?
+        AND json_extract(row, '$.sellerAccountId') = ? ORDER BY settled_seq LIMIT ?`,
+    ).all(since, sellerAccountId, limit) as unknown as (Stored & { settled_seq: number })[])
+      .map((s) => ({ ...read(s), settledSeq: s.settled_seq }));
   }
 
   async prune(beforeUnixS: number): Promise<number> {
@@ -64,8 +96,8 @@ export class SqliteSellerLedger implements SellerLedgerPort {
     return this.move(claimKey, 'submitted', { txHash });
   }
 
-  async recordSettled(claimKey: string, txHash: string): Promise<SellerPayment> {
-    return this.move(claimKey, 'settled', { txHash });
+  async recordSettled(claimKey: string, txHash: string, logIndex?: number): Promise<SellerPayment> {
+    return this.move(claimKey, 'settled', { txHash, ...(logIndex !== undefined ? { logIndex } : {}) });
   }
 
   async recordRefused(claimKey: string, code: AcceptErrorCode, txHash?: string): Promise<SellerPayment> {
@@ -90,8 +122,13 @@ export class SqliteSellerLedger implements SellerLedgerPort {
         throw new AcceptError(E.LEDGER_TRANSITION, `seller payment cannot move from ${current.status} to ${to}`);
       }
       const { status: _status, delivered: _delivered, ...rest } = { ...current, ...patch };
-      const { changes } = this.db.prepare('UPDATE seller_payments SET status = ?, row = ? WHERE claim_key = ? AND status = ?')
-        .run(to, JSON.stringify(rest), claimKey, current.status);
+      // One statement, so the next settled_seq is taken under SQLite's write lock: numbers follow commit order.
+      // shortcut: MAX restarts if pruning ever deletes the newest settled row (none settled for the retention years); keep a counter row then.
+      const { changes } = this.db.prepare(
+        `UPDATE seller_payments SET status = ?, row = ?, settled_seq = CASE WHEN ? = 'settled'
+          THEN (SELECT COALESCE(MAX(settled_seq), 0) + 1 FROM seller_payments) ELSE settled_seq END
+          WHERE claim_key = ? AND status = ?`,
+      ).run(to, JSON.stringify(rest), to, claimKey, current.status);
       if (changes === 1) return this.current(claimKey);
     }
   }

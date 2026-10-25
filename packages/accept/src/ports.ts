@@ -19,6 +19,8 @@ export interface TransferCall {
 export interface ChainLog {
   readonly address: string;
   readonly event: 'Transfer' | 'AuthorizationUsed';
+  /** The log's position in its block: with the txHash, it names one Transfer. */
+  readonly logIndex: number;
   readonly args: Readonly<Record<string, string | bigint>>;
 }
 
@@ -105,6 +107,8 @@ export interface SellerPayment extends NewSellerPayment {
   readonly status: SellerPaymentStatus;
   readonly delivered: boolean;
   readonly txHash?: string;
+  /** The payment's Transfer log in that transaction, once settled (absent on rows settled before it was stored). */
+  readonly logIndex?: number;
   readonly refusal?: AcceptErrorCode;
 }
 
@@ -120,7 +124,8 @@ export interface SellerLedgerPort {
   /** Writes the row as `owed`; never overwrites an existing row. */
   recordVerified(row: NewSellerPayment): Promise<{ readonly created: boolean; readonly row: SellerPayment }>;
   recordSubmitted(claimKey: string, txHash: string): Promise<SellerPayment>;
-  recordSettled(claimKey: string, txHash: string): Promise<SellerPayment>;
+  /** `logIndex` is the payment's Transfer log in `txHash`. */
+  recordSettled(claimKey: string, txHash: string, logIndex: number): Promise<SellerPayment>;
   /** `txHash` is kept when a mined transaction was refused (e.g. TRANSFER_MISMATCH), for reconciliation. */
   recordRefused(claimKey: string, code: AcceptErrorCode, txHash?: string): Promise<SellerPayment>;
   /** Sets the delivery flag; `first` is false if it was already set. */
