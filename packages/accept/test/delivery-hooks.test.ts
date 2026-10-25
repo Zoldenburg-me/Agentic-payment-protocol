@@ -230,11 +230,11 @@ const LEDGERS: readonly [string, () => MemorySellerLedger | SqliteSellerLedger][
 /** owed, settled-undelivered, settled-delivered and refused rows, all with validBefore 100 except `fresh`. */
 async function seed(l: SellerLedgerPort): Promise<void> {
   for (const k of ['owed', 'owing', 'done', 'refused', 'fresh']) await l.recordVerified(row(k, k === 'fresh' ? '300' : '100'));
-  await l.recordSettled('owing', TX);
-  await l.recordSettled('done', TX);
+  await l.recordSettled('owing', TX, 0);
+  await l.recordSettled('done', TX, 0);
   await l.markDelivered('done');
   await l.recordRefused('refused', E.EXPIRED);
-  await l.recordSettled('fresh', TX);
+  await l.recordSettled('fresh', TX, 0);
   await l.markDelivered('fresh');
 }
 

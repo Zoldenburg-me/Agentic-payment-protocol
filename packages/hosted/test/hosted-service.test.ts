@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { type RequestListener, type Server, createServer } from 'node:http';
+import { type RequestListener, type Server, createServer, request } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, it } from 'node:test';
 import { getAddress } from 'viem';
@@ -13,7 +13,7 @@ import { parseEnv } from '../src/env.js';
 import { errorLine, redactUrls } from '../src/log.js';
 import { MerchantStore } from '../src/merchants.js';
 import { waitForIdleRelay } from '../src/relay.js';
-import { type HostedLimits, MAX_BODY_BYTES, MAX_JSON_DEPTH, SETTLE_ROUTE, hostedService, nestsDeeper } from '../src/service.js';
+import { type HostedLimits, MAX_BODY_BYTES, MAX_JSON_DEPTH, SETTLED_ROUTE, SETTLE_ROUTE, hostedService, nestsDeeper } from '../src/service.js';
 
 const PAY_A = getAddress(`0x${'a1'.repeat(20)}`);
 const PAY_B = getAddress(`0x${'b2'.repeat(20)}`);
@@ -169,6 +169,7 @@ describe('hostedService: POST /api/agent-payments/settle', () => {
     const row = await new SqliteSellerLedger(h.db).get(claimKey);
     assert.equal(row?.status, 'settled');
     assert.equal(row?.sellerAccountId, 'shareme');
+    assert.equal(row?.logIndex, 1, 'the Transfer log, after AuthorizationUsed, from the receipt');
     assert.equal(h.chain.balanceOfSync(PAY_A), PRICE);
     assert.deepEqual(h.errors, []);
   });
@@ -313,6 +314,92 @@ describe('hostedService: POST /api/agent-payments/settle', () => {
     assert.equal(res.status, 500);
     assert.deepEqual(await res.json(), { error: 'INTERNAL' });
     assert.equal(h.errors.length, 1);
+  });
+});
+
+describe('hostedService: GET /api/agent-payments/settled', () => {
+  type Page = { payments: { seq: number; claim_key: string; txHash: string; logIndex?: number; amount: string; payTo: string; payer: string }[]; next_since: number };
+  const read = (url: string, key: string | undefined, query = '') =>
+    fetch(`${url}${SETTLED_ROUTE}${query}`, key === undefined ? {} : { headers: { authorization: `Bearer ${key}` } });
+
+  /** Merchants a and b; a has settled a1..a3, b has settled b1, and a has one owed and one refused row. */
+  async function seeded() {
+    const h = await hub();
+    const keyA = h.merchants.add('a', PAY_A);
+    const keyB = h.merchants.add('b', PAY_B);
+    const ledger = new SqliteSellerLedger(h.db);
+    const record = async (claimKey: string, seller: string, payTo: string, end?: 'settled' | 'refused') => {
+      await ledger.recordVerified({
+        claimKey, sellerAccountId: seller, protocol: 'x402', chainId: CHAIN_ID, asset: USDC, payer: h.buyer.address, nonce: claimKey, amount: '1000',
+        payTo, validBefore: String(NOW_S + 60), method: 'GET', path: '/', queryDigest: '', headerDigest: '', meta: {},
+      });
+      if (end === 'settled') await ledger.recordSettled(claimKey, `0x${claimKey.padStart(64, '0')}`, 3);
+      if (end === 'refused') await ledger.recordRefused(claimKey, 'EXPIRED');
+    };
+    await record('a1', 'a', PAY_A, 'settled');
+    await record('b1', 'b', PAY_B, 'settled');
+    await record('a0', 'a', PAY_A); // owed
+    await record('a2', 'a', PAY_A, 'settled');
+    await record('ax', 'a', PAY_A, 'refused');
+    await record('a3', 'a', PAY_A, 'settled');
+    return { ...h, keyA, keyB, ledger, record };
+  }
+
+  it('pages one merchant\'s settled payments by seq, oldest first, owed and refused rows left out', async () => {
+    const h = await seeded();
+    const first = (await (await read(h.url, h.keyA, '?limit=2')).json()) as Page;
+    assert.deepEqual(first.payments.map((p) => p.claim_key), ['a1', 'a2']);
+    assert.deepEqual(first.payments[0], {
+      seq: 1, claim_key: 'a1', txHash: `0x${'a1'.padStart(64, '0')}`, logIndex: 3, amount: '1000', chainId: CHAIN_ID, asset: USDC, payTo: PAY_A, payer: h.buyer.address,
+    });
+    const second = (await (await read(h.url, h.keyA, `?since=${first.next_since}&limit=2`)).json()) as Page;
+    assert.deepEqual(second.payments.map((p) => p.claim_key), ['a3']);
+    const done = (await (await read(h.url, h.keyA, `?since=${second.next_since}`)).json()) as Page;
+    assert.deepEqual(done, { payments: [], next_since: second.next_since }, 'an empty page keeps the cursor');
+  });
+
+  it('a payment that settles after a later one is still listed once: pages follow settlement, not arrival', async () => {
+    const h = await seeded();
+    const all = async (since: number) => (await (await read(h.url, h.keyA, `?since=${since}`)).json()) as Page;
+    const before = await all(0);
+    assert.deepEqual(before.payments.map((p) => p.claim_key), ['a1', 'a2', 'a3'], 'a0 arrived before a2 but is still owed');
+    await h.ledger.recordSettled('a0', `0x${'a0'.padStart(64, '0')}`, 0); // X settles after Y
+    const after = await all(before.next_since);
+    assert.deepEqual(after.payments.map((p) => p.claim_key), ['a0'], 'past the cursor, and only once');
+    assert.deepEqual((await all(after.next_since)).payments, []);
+  });
+
+  it('a merchant only ever reads its own rows; naming another merchant is 403', async () => {
+    const h = await seeded();
+    const b = (await (await read(h.url, h.keyB, `?merchant=${PAY_B.toLowerCase()}`)).json()) as Page;
+    assert.deepEqual(b.payments.map((p) => p.claim_key), ['b1']);
+    const wrong = await read(h.url, h.keyB, `?merchant=${PAY_A}`);
+    assert.equal(wrong.status, 403);
+    assert.deepEqual(await wrong.json(), { error: 'FORBIDDEN' });
+  });
+
+  it('refuses a missing or unknown key, and bad paging values', async () => {
+    const h = await seeded();
+    assert.equal((await read(h.url, undefined)).status, 401);
+    assert.equal((await read(h.url, `zsk_${'0'.repeat(16)}_${'0'.repeat(64)}`)).status, 401);
+    for (const q of ['?since=-1', '?since=1.5', '?limit=0', '?limit=501', '?limit=x']) assert.equal((await read(h.url, h.keyA, q)).status, 400, q);
+    assert.equal((await read(h.url, h.keyA, '?limit=500')).status, 200);
+    assert.equal((await fetch(`${h.url}${SETTLED_ROUTE}`, { method: 'POST', headers: { authorization: `Bearer ${h.keyA}` } })).status, 404, 'read-only');
+    const raw = await new Promise<number>((resolve) => { // fetch normalises '//'; send it as is
+      request(`${h.url}//`, { method: 'GET' }, (r) => { r.resume(); resolve(r.statusCode ?? 0); }).end();
+    });
+    assert.equal(raw, 404, 'a path no URL parser takes is still a 404');
+    assert.deepEqual(h.errors, []);
+  });
+
+  it('shares the per-IP failed-key lockout and limits reads per key per minute', async () => {
+    const h = await hub({ perMinute: 2, failedKeysPerMinute: 1 });
+    const key = h.merchants.add('a', PAY_A);
+    assert.equal((await read(h.url, key)).status, 200);
+    assert.equal((await read(h.url, key)).status, 200);
+    assert.equal((await read(h.url, key)).status, 429);
+    assert.equal((await read(h.url, 'zsk_bad')).status, 401);
+    assert.equal((await post(h.url, { key })).status, 429, 'the IP is locked out of settle too');
   });
 });
 

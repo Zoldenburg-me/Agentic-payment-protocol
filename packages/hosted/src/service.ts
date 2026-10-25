@@ -10,6 +10,11 @@ import { Counters } from './counters.js';
 import type { Merchant, MerchantStore } from './merchants.js';
 
 export const SETTLE_ROUTE = '/api/agent-payments/settle';
+/** GET: the calling merchant's settled payments, `?since=<seq>&limit=<n>`, in the order they settled. */
+export const SETTLED_ROUTE = '/api/agent-payments/settled';
+const SETTLED_LIMIT = 100;
+const SETTLED_MAX = 500;
+const UINT = /^(0|[1-9][0-9]{0,14})$/; // below 2^53, so Number() is exact
 /** A settle request is a few KB of payment headers. */
 export const MAX_BODY_BYTES = 128 * 1024;
 const MINUTE_MS = 60_000;
@@ -98,7 +103,7 @@ function scopedLedger(ledger: SellerLedgerPort, id: string): SellerLedgerPort {
     list: async () => (await ledger.list()).filter((row) => row.sellerAccountId === id),
     recordVerified: (row) => ledger.recordVerified(row),
     recordSubmitted: (k, tx) => ledger.recordSubmitted(k, tx),
-    recordSettled: (k, tx) => ledger.recordSettled(k, tx),
+    recordSettled: (k, tx, logIndex) => ledger.recordSettled(k, tx, logIndex),
     recordRefused: (k, code, tx) => ledger.recordRefused(k, code, tx),
     markDelivered: (k) => ledger.markDelivered(k),
   };
@@ -169,16 +174,47 @@ export function hostedService(o: HostedServiceOptions) {
     onError: o.onError,
   });
 
-  async function serve(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== 'POST' || req.url !== SETTLE_ROUTE) return send(res, 404, { error: 'NOT_FOUND' });
+  /** The merchant the bearer key belongs to, or undefined once a 401 or 429 is sent; failures count per client IP. */
+  function authenticate(req: IncomingMessage, res: ServerResponse): Merchant | undefined {
     const failedKey = `failed:${toReqLike(req, { trustedProxyHops: o.trustedProxyHops ?? 0 }).clientIp}`;
-    if (counters.spent(failedKey, limits.failedKeysPerMinute, now())) return send(res, 429, { error: 'RATE_LIMITED' }, { 'retry-after': '60' });
-    const authorization = req.headers.authorization;
-    // The key is checked before the body is read; hostedSettle checks it again, which costs one lookup.
-    if (o.merchants.verify(BEARER.exec(authorization ?? '')?.[1] ?? '') === undefined) {
-      counters.take(failedKey, limits.failedKeysPerMinute, MINUTE_MS, now());
-      return send(res, 401, { error: 'UNAUTHORIZED' });
+    if (counters.spent(failedKey, limits.failedKeysPerMinute, now())) {
+      send(res, 429, { error: 'RATE_LIMITED' }, { 'retry-after': '60' });
+      return undefined;
     }
+    const merchant = o.merchants.verify(BEARER.exec(req.headers.authorization ?? '')?.[1] ?? '');
+    if (merchant === undefined) {
+      counters.take(failedKey, limits.failedKeysPerMinute, MINUTE_MS, now());
+      send(res, 401, { error: 'UNAUTHORIZED' });
+    }
+    return merchant;
+  }
+
+  /** Read-only: only ever the authenticated merchant's own rows; `merchant`, if given, must be its payTo. */
+  async function settled(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const m = authenticate(req, res);
+    if (m === undefined) return;
+    if (!counters.take(`read:${m.id}`, limits.perMinute, MINUTE_MS, now())) return send(res, 429, { error: 'RATE_LIMITED' }, { 'retry-after': '60' });
+    const q = new URLSearchParams(req.url?.split('?')[1] ?? '');
+    const merchant = q.get('merchant');
+    if (merchant !== null && merchant.toLowerCase() !== m.payTo.toLowerCase()) return send(res, 403, { error: 'FORBIDDEN' });
+    const since = q.get('since') ?? '0';
+    const limit = q.get('limit') ?? String(SETTLED_LIMIT);
+    if (!UINT.test(since) || !UINT.test(limit) || Number(limit) < 1 || Number(limit) > SETTLED_MAX) return send(res, 400, { error: 'MALFORMED' });
+    const rows = ledger.settledSince(m.id, Number(since), Number(limit));
+    send(res, 200, {
+      payments: rows.map((r) => ({
+        seq: r.settledSeq, claim_key: r.claimKey, txHash: r.txHash, logIndex: r.logIndex ?? null, amount: r.amount, chainId: r.chainId, asset: r.asset, payTo: r.payTo, payer: r.payer,
+      })),
+      next_since: rows.at(-1)?.settledSeq ?? Number(since),
+    });
+  }
+
+  async function serve(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method === 'GET' && req.url?.split('?')[0] === SETTLED_ROUTE) return settled(req, res);
+    if (req.method !== 'POST' || req.url !== SETTLE_ROUTE) return send(res, 404, { error: 'NOT_FOUND' });
+    // The key is checked before the body is read; hostedSettle checks it again, which costs one lookup.
+    if (authenticate(req, res) === undefined) return;
+    const authorization = req.headers.authorization;
     const text = await readBody(req);
     if (text === undefined) return send(res, 413, { error: 'TOO_LARGE' }, { connection: 'close' });
     if (nestsDeeper(text, MAX_JSON_DEPTH)) return send(res, 400, { error: 'MALFORMED' });

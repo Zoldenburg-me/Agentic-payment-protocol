@@ -254,10 +254,10 @@ async function deliver(ctx: Ctx, claimKey: string, settled: boolean): Promise<Ac
 /** Ledger moves re-read the row first, so a payment settled or refused meanwhile (another process) is not moved twice. */
 const isOpen = (row: SellerPayment | undefined): boolean => row?.status === 'owed' || row?.status === 'submitted';
 
-async function settleRow(ctx: Ctx, claimKey: string, txHash: string): Promise<void> {
+async function settleRow(ctx: Ctx, claimKey: string, done: { txHash: string; logIndex: number }): Promise<void> {
   if (!isOpen(await ctx.deps.ledger.get(claimKey))) return;
   try {
-    await ctx.deps.ledger.recordSettled(claimKey, txHash);
+    await ctx.deps.ledger.recordSettled(claimKey, done.txHash, done.logIndex);
   } catch (error) {
     // Lost a race with another process: its final state (settled, or refused) stands; the caller reads it.
     if (isOpen(await ctx.deps.ledger.get(claimKey))) throw error;
@@ -363,7 +363,7 @@ const verdict = (kind: 'refused' | 'open', code: AcceptErrorCode, status = statu
 async function judge(ctx: Ctx, row: SellerPayment, e: Expected, txHash: Hex): Promise<Verdict> {
   const done = await confirm(ctx.env, e, txHash);
   if (done.ok) {
-    await settleRow(ctx, row.claimKey, done.txHash);
+    await settleRow(ctx, row.claimKey, done);
     return { kind: 'settled' };
   }
   reportFailure(ctx, row.claimKey, done);
@@ -586,7 +586,7 @@ async function refuse(ctx: Ctx, s: Settling, f: SettleFailure): Promise<AcceptRe
 async function finishInBackground(ctx: Ctx, s: Settling, txHash: Hex): Promise<void> {
   try {
     const done = await confirm(ctx.env, s.e, txHash);
-    if (done.ok) return await settleRow(ctx, s.claimKey, done.txHash);
+    if (done.ok) return await settleRow(ctx, s.claimKey, done);
     if (done.final) await refuseRow(ctx, s.claimKey, done.code, done.txHash);
     // confirm never frees a claim: the row exists, so the claim stays with it.
     report(ctx, failureReport(s.claimKey, done) ?? new AcceptError(done.code, 'an optimistically delivered payment did not settle'));
@@ -609,7 +609,7 @@ async function confirmAndDeliver(ctx: Ctx, s: Settling, txHash: Hex, ours: boole
   }
   const done = await confirm(ctx.env, s.e, txHash);
   if (!done.ok) return { result: await refuse(ctx, s, done), handedOff: false };
-  await settleRow(ctx, s.claimKey, done.txHash);
+  await settleRow(ctx, s.claimKey, done);
   return { result: await deliverSettled(ctx, s.claimKey, s.req, s.price), handedOff: false };
 }
 

@@ -273,16 +273,16 @@ export class FakeFiatToken implements ChainPort, Submitter {
       this.balances.set(a.to.toLowerCase(), this.balanceOfSync(a.to) + a.value);
       this.used.set(key(a.from, a.nonce), tx.hash);
     }
-    const logs: ChainLog[] = success ? this.logsFor(a) : [];
+    const logs: ChainLog[] = success ? this.logsFor(a).map((l, i) => ({ ...l, logIndex: i })) : [];
     this.receipts.set(tx.hash, { txHash: tx.hash, status: success ? 'success' : 'reverted', blockNumber, logs });
     return success;
   }
 
-  private logsFor(a: TransferCall['authorization']): ChainLog[] {
+  private logsFor(a: TransferCall['authorization']): Omit<ChainLog, 'logIndex'>[] {
     const asset = this.options.asset;
     const mode = this.tamperLogs;
-    const used: ChainLog = { address: asset, event: 'AuthorizationUsed', args: { authorizer: a.from, nonce: a.nonce } };
-    const transfer: ChainLog = {
+    const used: Omit<ChainLog, 'logIndex'> = { address: asset, event: 'AuthorizationUsed', args: { authorizer: a.from, nonce: a.nonce } };
+    const transfer: Omit<ChainLog, 'logIndex'> = {
       address: asset, event: 'Transfer',
       args: { from: a.from, to: mode === 'to' ? a.from : a.to, value: mode === 'value' ? a.value - 1n : a.value },
     };
